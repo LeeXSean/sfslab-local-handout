@@ -44,6 +44,7 @@ baseline: test-sfs-baseline
 	  | awk -v n=$(BASELINE_RUNS) 'NR==int((n+1)/2){print; exit}' \
 	  > .perf_baseline
 	@printf 'SFS_DISK_DIR=%s\n' "$${SFS_DISK_DIR:-(unset)}" >> .perf_baseline
+	@printf 'WORKLOAD=v2\n' >> .perf_baseline  # keep in sync with PERF_WORKLOAD_VERSION (local/test-sfs.c)
 	@awk 'NR==1{min=$$1; max=$$1} \
 	      {if($$1<min)min=$$1; if($$1>max)max=$$1} \
 	      END{printf "  spread: min=%.2f max=%.2f (%.1f%% of midpoint)\n", \
@@ -110,6 +111,19 @@ stress: test-sfs sfs-fsck
 	  i=$$((i+1)); \
 	done
 .PHONY: stress
+
+# Differential fuzz against the in-memory reference model (diagnostic).
+# Override the seed with: make model-fuzz MODEL_FUZZ_SEED=N
+MODEL_FUZZ_SEED ?= 1
+
+model-fuzz: test-sfs sfs-fsck
+	./test-sfs --model-fuzz=$(MODEL_FUZZ_SEED)
+.PHONY: model-fuzz
+
+# Optional challenges (not scored); exits nonzero until all are achieved.
+x-traces: test-sfs sfs-fsck
+	./test-sfs --x-only
+.PHONY: x-traces
 
 check: starter-check trace-check manifest-check smoke
 .PHONY: check

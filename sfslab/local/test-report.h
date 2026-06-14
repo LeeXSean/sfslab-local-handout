@@ -17,7 +17,7 @@ const char *tsan_clean_json(enum tsan_result result);
 
 void test_report_print_score_json(int a, int b, int c,
                                   enum tsan_result tsan,
-                                  int perf, int perf_ran);
+                                  int perf, int perf_ran, int x);
 void test_report_print_trace_set_json(const char *name, int score, int max,
                                       int graded);
 

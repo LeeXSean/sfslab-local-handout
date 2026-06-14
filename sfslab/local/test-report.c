@@ -33,7 +33,7 @@ const char *tsan_clean_json(enum tsan_result result)
 
 void test_report_print_score_json(int a, int b, int c,
                                   enum tsan_result tsan,
-                                  int perf, int perf_ran)
+                                  int perf, int perf_ran, int x)
 {
     int correctness = a + b + c;
     int total = correctness + perf;
@@ -52,6 +52,8 @@ void test_report_print_score_json(int a, int b, int c,
     printf("  \"performance\": {\"score\": %d, \"max\": 10, \"ran\": %s},\n",
            perf, perf_ran ? "true" : "false");
     printf("  \"total\": {\"score\": %d, \"max\": 22},\n", total);
+    printf("  \"x_traces\": {\"score\": %d, \"max\": 3, \"graded\": false},\n",
+           x);
     printf("  \"style\": {\"max\": 4, \"manual\": true},\n");
     printf("  \"passed\": %s\n", correctness == 12 ? "true" : "false");
     printf("}\n");

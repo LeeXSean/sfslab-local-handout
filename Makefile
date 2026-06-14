@@ -55,6 +55,14 @@ starter-safe:
 stress:
 	$(MAKE) -C $(HANDOUT) stress
 
+.PHONY: model-fuzz
+model-fuzz:
+	$(MAKE) -C $(HANDOUT) model-fuzz
+
+.PHONY: x-traces
+x-traces:
+	$(MAKE) -C $(HANDOUT) x-traces
+
 .PHONY: check
 check:
 	$(MAKE) -C $(HANDOUT) check
