@@ -37,6 +37,9 @@
 /** Amount of detail printed during the checking process.  */
 static unsigned int verbose = 0;
 
+/** When nonzero, print a structural dump of the image before checking it. */
+static unsigned int dump_mode = 0;
+
 /** The bytemap is a C-string with one byte per block, indicating what
     we know about the disk image at any point in the process of
     checking.  Its primary purpose is to identify blocks that, after
@@ -656,10 +659,179 @@ static int check_for_lost_blocks(const char *disk,
     return status;
 }
 
+/* ================================================================== */
+/*  Structural dump (--dump)                                          */
+/* ================================================================== */
+
+/** Bounded, non-aborting variant of get_block for the dumper.  Returns
+    NULL for id 0 and for ids beyond the mapped image, so a corrupt
+    image can still be displayed without crashing the tool.  */
+static const sfs_block_hdr_t *dump_get_block(const sfs_filesystem_t *superblock,
+                                             size_t limit_blocks, block_id id)
+{
+    if (id == 0 || (size_t)id >= limit_blocks)
+        return NULL;
+    return (const sfs_block_hdr_t *)(((const char *)superblock) +
+                                     (size_t)SFS_BLOCK_SIZE * id);
+}
+
+/** Print one block chain starting at FIRST.  The walk is capped at the
+    number of mapped blocks so circular or cross-linked lists cannot
+    hang the dumper; blocks whose type tag disagrees with EXPECT_TYPE
+    are annotated inline.  */
+static void dump_chain(const sfs_filesystem_t *superblock, size_t limit_blocks,
+                       block_id first, const char *expect_type)
+{
+    const size_t display_cap = 8;
+    size_t steps = 0;
+
+    printf("blocks:");
+    block_id cur = first;
+    while (cur != 0)
+    {
+        if (steps >= limit_blocks)
+        {
+            printf(" ...stopped after %zu steps (possible cycle)", steps);
+            break;
+        }
+        const sfs_block_hdr_t *blk =
+            dump_get_block(superblock, limit_blocks, cur);
+        if (blk == NULL)
+        {
+            printf(" %u[!out of range]", cur);
+            steps++;
+            break;
+        }
+        if (steps < display_cap)
+        {
+            printf(" %u", cur);
+            if (memcmp(blk->type, expect_type, sizeof blk->type) != 0)
+            {
+                const char *lab = sfs_block_type_label(blk->type);
+                printf("[!%s]", lab ? lab : "bad type tag");
+            }
+        }
+        else if (steps == display_cap)
+        {
+            printf(" ...");
+        }
+        steps++;
+        cur = blk->next_block;
+    }
+    printf("  (%zu block%s walked)\n", steps, steps == 1 ? "" : "s");
+}
+
+/** Print every in-use directory entry in FILES, with its name, size,
+    and allocation chain.  BASE_INDEX is the entry number of FILES[0]
+    across the whole (possibly multi-block) directory.  */
+static void dump_dir_entries(const sfs_filesystem_t *superblock,
+                             size_t limit_blocks,
+                             const sfs_dir_entry_t *files, size_t base_index)
+{
+    for (size_t i = 0; i < DIR_ENTRIES_PER_BLOCK; i++)
+    {
+        if (files[i].first_block == 0)
+            continue;
+        size_t name_len = strnlen(files[i].name, SFS_FILE_NAME_SIZE_LIMIT);
+        printf("  entry %2zu: '", base_index + i);
+        fput_escaped_n((const unsigned char *)files[i].name, name_len, stdout);
+        printf("'%s, size %u, ",
+               name_len == SFS_FILE_NAME_SIZE_LIMIT ? " [!name unterminated]"
+                                                    : "",
+               files[i].size);
+        dump_chain(superblock, limit_blocks, files[i].first_block,
+                   SFS_BLOCK_TYPE_FILE);
+    }
+}
+
+/** Print a human-oriented structural dump of the image: superblock
+    summary, free list, directory entries with their block chains, and
+    a block-type tally.  Unlike the checker, this shows what the image
+    looks like rather than only what is wrong with it.  */
+static void dump_image(const char *disk, const sfs_filesystem_t *superblock,
+                       size_t image_size)
+{
+    size_t limit_blocks = image_size / SFS_BLOCK_SIZE;
+
+    printf("=== SFS structural dump: %s ===\n", disk);
+    if (memcmp(superblock->magic, SFS_DISK_MAGIC, sizeof superblock->magic))
+    {
+        printf("superblock: bad magic -- not an SFS image (or format version"
+               " mismatch); dump aborted\n");
+        return;
+    }
+    printf("superblock: %zu bytes, %zu blocks mapped, n_blocks field %u%s\n",
+           image_size, limit_blocks, superblock->n_blocks,
+           (size_t)superblock->n_blocks == limit_blocks ? ""
+                                                        : "  [!mismatch]");
+
+    printf("free list: ");
+    dump_chain(superblock, limit_blocks, superblock->freelist,
+               SFS_BLOCK_TYPE_FREE);
+
+    printf("root directory (superblock entries%s):\n",
+           superblock->next_rootdir ? " + extension chain" : "");
+    dump_dir_entries(superblock, limit_blocks, superblock->files, 0);
+
+    size_t base_index = DIR_ENTRIES_PER_BLOCK;
+    size_t dir_steps = 0;
+    block_id db = superblock->next_rootdir;
+    while (db != 0)
+    {
+        if (dir_steps >= limit_blocks)
+        {
+            printf("  ...stopped walking directory extension blocks after"
+                   " %zu steps (possible cycle)\n", dir_steps);
+            break;
+        }
+        const sfs_block_hdr_t *dh =
+            dump_get_block(superblock, limit_blocks, db);
+        if (dh == NULL)
+        {
+            printf("  [directory extension block %u out of range]\n", db);
+            break;
+        }
+        if (memcmp(dh->type, SFS_BLOCK_TYPE_DIR, sizeof dh->type) != 0)
+        {
+            const char *lab = sfs_block_type_label(dh->type);
+            printf("  [directory extension block %u has wrong type: %s]\n",
+                   db, lab ? lab : "bad type tag");
+            break;
+        }
+        printf("  -- extension block %u --\n", db);
+        dump_dir_entries(superblock, limit_blocks,
+                         ((const sfs_block_dir_t *)dh)->files, base_index);
+        base_index += DIR_ENTRIES_PER_BLOCK;
+        dir_steps++;
+        db = dh->next_block;
+    }
+
+    size_t n_free = 0, n_file = 0, n_dir = 0, n_other = 0;
+    for (size_t i = 1; i < limit_blocks; i++)
+    {
+        const sfs_block_hdr_t *b =
+            dump_get_block(superblock, limit_blocks, (block_id)i);
+        if (memcmp(b->type, SFS_BLOCK_TYPE_FREE, sizeof b->type) == 0)
+            n_free++;
+        else if (memcmp(b->type, SFS_BLOCK_TYPE_FILE, sizeof b->type) == 0)
+            n_file++;
+        else if (memcmp(b->type, SFS_BLOCK_TYPE_DIR, sizeof b->type) == 0)
+            n_dir++;
+        else
+            n_other++;
+    }
+    printf("block type tally: %zu free, %zu file, %zu dir, %zu other"
+           " (+1 superblock)\n", n_free, n_file, n_dir, n_other);
+    printf("=== end dump ===\n");
+}
+
 // Command line parsing functions and data
 static const struct argp_option command_line_options[] = {
     {"verbose", 'v', 0, 0,
      "Describe progress of the file system check (repeat for more detail)", 0},
+    {"dump", 'd', 0, 0,
+     "Print a structural dump of the image (superblock, directory, block"
+     " chains) before checking it", 0},
     {0, 0, 0, 0, 0, 0}};
 
 static int command_line_parse_1(int key, char *arg, struct argp_state *state)
@@ -673,6 +845,9 @@ static int command_line_parse_1(int key, char *arg, struct argp_state *state)
         {
             argp_error(state, "cannot be that verbose");
         }
+        return 0;
+    case 'd':
+        dump_mode = 1;
         return 0;
     case ARGP_KEY_ARG:
         if (*diskp)
@@ -717,6 +892,14 @@ int main(int argc, char **argv)
     size_t imagesize;
     if (map_disk_image(disk, &superblock, &imagesize))
         return 1;
+
+    if (dump_mode)
+    {
+        dump_image(disk, superblock, imagesize);
+        /* The dump goes to stdout but check errors go to stderr; flush so
+           the two phases cannot interleave in a terminal or a log file. */
+        fflush(stdout);
+    }
 
     unsigned char *bytemap;
     if (check_superblock(disk, superblock, imagesize, &bytemap))
