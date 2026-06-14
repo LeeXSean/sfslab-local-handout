@@ -47,6 +47,15 @@ Expected starter status:
   graded/core fields even when environment-dependent diagnostics differ.
 - `docs/examples/test_compare_starter_report.py` passes.
 - `sfs_getpos`, `sfs_seek`, and `sfs_rename` remain `-ENOSYS` stubs.
+- `make stress` fails on the starter (S01 exercises the unimplemented
+  `sfs_rename`); in `make report-json` this appears as
+  `stress_diagnostics.exit_status != 0` and `diagnostics_passed: false`
+  without failing report generation.
+- `make model-fuzz` passes on the starter (unimplemented calls are modeled
+  as no-ops and counted in the trace output).
+- The default `./test-sfs` run ends with a `Category X` footer showing
+  `Achieved: 0/3`; X traces never appear in `--list-traces`, so
+  `make manifest-check` is unaffected.
 
 ## Version Tags
 

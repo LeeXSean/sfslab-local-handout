@@ -30,9 +30,9 @@ the packaged handout so students see a smaller, assignment-style document set.
   API.
 - `make trace-json` reports the Lua trace catalog as separate diagnostic
   coverage, not as part of the local 22-point score.
-- `make report-json` combines the local score, Lua trace coverage, and stress
-  diagnostics into one machine-readable report. Only the local autograder
-  section is the graded 22-point score.
+- `make report-json` combines the local score, Lua trace coverage, stress
+  diagnostics, and a fixed-seed model-fuzz section into one machine-readable
+  report. Only the local autograder section is the graded 22-point score.
 - The repository root `Dockerfile` provides a Linux toolchain for builds,
   ThreadSanitizer runs, and Lua trace execution. Root trace targets use it as
   a fallback when the host is missing Lua headers or `pkg-config`.
@@ -42,10 +42,16 @@ the packaged handout so students see a smaller, assignment-style document set.
   for local validation. `make check` is the normal development health check;
   `make dist-check` is the stricter package cleanliness check.
 - `make stress` repeats the C concurrency traces and extra stress-only
-  diagnostics to expose nondeterministic failures after you have an
-  implementation to test; it is not a starter health check.
-- `make baseline` writes `.perf_baseline` so performance is scored against the
-  current machine instead of CMU's Autolab hardware.
+  diagnostics (S00 directory churn, S01 rename atomicity) to expose
+  nondeterministic failures after you have an implementation to test; it is
+  not a starter health check.
+- `make model-fuzz` runs a seed-reproducible random op sequence against an
+  in-memory reference model, with periodic fsck checkpoints. Diagnostic only.
+- `make x-traces` runs the unscored optional X challenges referenced by the
+  "optional challenge" comments in `sfs-disk.c`.
+- `make baseline` writes `.perf_baseline` (tagged with the benchmark workload
+  version) so performance is scored against the current machine instead of
+  CMU's Autolab hardware; without it the performance score is capped at 5/10.
 - ThreadSanitizer is used locally as the race detector when available.
 
 ## Academic Integrity Boundary

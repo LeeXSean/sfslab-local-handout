@@ -41,6 +41,9 @@ make doctor       # explain local toolchain readiness and fallbacks
 make check        # development health check
 make json         # local 22-point score as JSON
 make report-json  # score plus diagnostics
+make stress       # repeat concurrency traces + stress diagnostics (S00/S01)
+make model-fuzz   # differential model fuzz (seed-reproducible diagnostic)
+make x-traces     # optional unscored X challenges
 make dist-verify  # rebuild and unpack-check sfslab-handout.tar
 ```
 
@@ -75,8 +78,11 @@ Inside `sfslab/`, the main files are:
 ## Starter Boundary
 
 The local 22-point score is frozen at A=5, B=4, C=3, Performance=10. Lua trace
-coverage and stress diagnostics are reported separately and do not raise the
-main score.
+coverage, stress diagnostics, model fuzz, and the optional X traces are
+reported separately and do not raise the main score. (The performance
+*thresholds* inside those 10 points were deliberately recalibrated in 2026-06
+so that fine-grained locking is what earns full performance credit; see
+`sfslab/SCORING.md`.)
 
 The starter intentionally leaves `sfs_getpos`, `sfs_seek`, and `sfs_rename`
 incomplete. Those are part of the self-study work, not a packaging bug.

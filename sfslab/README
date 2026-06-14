@@ -33,7 +33,9 @@ Suggested order:
     4. Edit only `sfs-disk.c`.
     5. Run `make test` after each change.
     6. Work through Category A, then B, then C.
-    7. Tune performance only after correctness reaches 12/12.
+    7. Tune performance only after correctness reaches 12/12. Use
+       `make grade` (it calibrates `.perf_baseline` first); without a
+       calibrated baseline the performance score is capped at 5/10.
 
 Main test command:
 
@@ -47,6 +49,13 @@ Setup and cleanup commands:
 Optional score details:
 
     make json         Print the local 22-point score as JSON.
+
+Optional diagnostics (useful once you start the concurrency work; none of
+these change the 22-point score):
+
+    make stress       Repeat the concurrency traces plus stress diagnostics.
+    make model-fuzz   Random differential test against a reference model.
+    make x-traces     The optional X challenges from the sfs-disk.c comments.
 
 The unmodified starter is expected to fail the full autograder because some
 functions are intentionally left for you to implement. `make check` passing

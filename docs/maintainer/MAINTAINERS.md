@@ -34,6 +34,44 @@ assumptions and block-device sizing. They are not part of the student task and
 do not affect the local grading path. Treat them as support-tool maintenance,
 not as assignment requirements.
 
+## 2026-06 Revision Record
+
+Landed 2026-06-12. Everything below is diagnostic-only except the one
+deliberate scoring revision called out explicitly.
+
+- **`freeBlocks` fix (handout + baseline-ref).** Prepending a freed chain to
+  the free list did not re-aim the old head's `prev_block`, leaving the
+  doubly linked free list inconsistent. `sfs-fsck` flags exactly this, so a
+  spec-correct student solution failed A04/B01 through no fault of its own
+  (B00 only survived because each remove was immediately followed by an open
+  that reallocated the stale head). Fixed identically in `sfs-disk.c` and
+  `local/sfs-baseline-ref.c`; the three `-ENOSYS` stubs are untouched, and
+  the lab is now actually solvable to 12/12.
+- **Deliberate performance scoring revision.** Weights unchanged (Perf is
+  still 10 of 22). The old benchmark's timed region was dominated by thread
+  spawn and the ladder gave 10/10 at >= 0.90x, so a coarse global mutex
+  earned full marks. The v2 workload barriers out spawn cost and amortizes
+  open/close over per-file I/O; the new ladder pays 3/10 at ~1.0x (coarse)
+  and 10/10 from 2.5x up. Missing or workload-mismatched `.perf_baseline`
+  now caps at 5/10. Method and measurements:
+  `docs/maintainer/PERF_CALIBRATION.md`; student-facing text: writeup 5.1
+  and SCORING.md.
+- **New diagnostics (unscored).** S01 rename-atomicity stress trace (stress
+  max 1 -> 2); seeded schedule fuzz (`--sched-fuzz[=SEED]`, used by the
+  TSan sweep, which now runs three fuzzed schedules and reports the failing
+  seed); differential model fuzz (`--model-fuzz[=SEED]`, `make model-fuzz`,
+  fixed-seed `model_fuzz` section in report-json); failing-trace disk image
+  snapshots (`fail_<id>_*.img`) paired with the new `sfs-fsck --dump` mode.
+- **X traces.** The three "optional challenge" comments in `sfs-disk.c` now
+  have unscored X00/X01/X02 traces (`make x-traces`; writeup section 7).
+  They print after the scoreboard, appear in JSON as `x_traces` with
+  `"graded": false`, and never appear in `--list-traces`, so the manifest
+  contract is untouched. X02 intentionally conflicts with B02's documented
+  `-EBUSY` semantics; the writeup frames it as a post-grading exploration.
+- **TSan on hosts with high-entropy ASLR.** Persistent "unexpected memory
+  mapping" failures retry under `setarch -R` automatically and otherwise
+  degrade to `unavailable` (no penalty) instead of zeroing Category C.
+
 ## Core Next Work
 
 - Run `docs/maintainer/RELEASE.md` before publishing a handout tarball.

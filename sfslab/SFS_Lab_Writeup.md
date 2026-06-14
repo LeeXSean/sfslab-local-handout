@@ -81,7 +81,11 @@ an idle system. Override the sample count with `make baseline BASELINE_RUNS=N`
 
 Your perf score is then a ratio of your implementation's throughput to this
 baseline, so results are comparable across laptops. You can defer this until
-the A/B/C correctness tests pass; it is not needed for the starter health check.
+the A/B/C correctness tests pass; it is not needed for the starter health
+check. Without a calibrated baseline the performance score is **capped at
+5/10** (absolute throughput cannot show whether your locking *scales*), so run
+`make baseline` -- or `make grade`, which does it for you -- before reading
+anything into the perf number.
 
 ### 2.3 Running Tests
 
@@ -309,7 +313,8 @@ suppressed)`.
   you only want the scoreboard.
 - `./test-sfs -v` (`--verbose`) raises the cap to unlimited.
 
-Flags can appear in any order and combine with `--tsan-only`.
+Flags can appear in any order and combine with the mode flags
+(`--tsan-only`, `--stress-only`, `--model-fuzz`, `--x-only`, ...).
 (`--perf-only` only emits a single ops/sec number, so verbosity has no
 effect there.)
 
@@ -317,15 +322,35 @@ effect there.)
 autograder automatically compiles a ThreadSanitizer build and re-runs the concurrent
 tests. The normal C traces serialize individual SFS API calls so partially
 completed starters get stable functional feedback; the TSan rerun disables that
-guard and makes real concurrent calls. If TSan detects any data races, the
-Category C score is set to 0 -- even if the normal traces appeared to pass. This
-mirrors the original CMU ConTech-based race detection. If a normal correctness
-trace already fails, TSan is skipped and the normal per-trace score is reported.
-If your system does not support `-fsanitize=thread`, the TSan check is skipped
-without penalty.
+guard and makes real concurrent calls. The rerun sweeps **three seeded
+schedule-fuzz runs** (seeds 1-3; see `--sched-fuzz` below), each perturbing
+thread timing differently, so races that hide under one particular
+interleaving still get a chance to surface; the failing seed is reported so
+you can replay it. If TSan detects any data races, the Category C score is set
+to 0 -- even if the normal traces appeared to pass. This mirrors the original
+CMU ConTech-based race detection. If a normal correctness trace already
+fails, TSan is skipped and the normal per-trace score is reported. If your
+system does not support `-fsanitize=thread`, the TSan check is skipped without
+penalty (on kernels whose address-space randomization confuses TSan, the
+grader automatically retries under `setarch -R` first).
 
-The performance benchmark uses 8 threads each doing 100 open/write/seek/read/close
-cycles. The benchmark is **sampled 5 times and the median ops/sec is scored**,
+**Schedule fuzz (`--sched-fuzz[=SEED]`):** the concurrency traces can inject
+seeded random `sched_yield()`s and microsleeps around SFS calls, shaking out
+schedules the default timing never produces. The same seed reproduces the
+same perturbation pattern, so a failure found under fuzz is replayable:
+`./test-sfs --tsan-only --sched-fuzz=2` (env: `SFS_SCHED_FUZZ_SEED`). The
+scored run does not fuzz; only the TSan sweep and explicit `--sched-fuzz`
+invocations do, so no flakiness is added to the graded path.
+
+The performance benchmark runs 8 threads, each against its own file. A thread
+performs 2000 *sessions*: one `sfs_open`, then 10 rounds of
+write/seek/getpos/read, then one `sfs_close` (672,000 API calls total per
+run). Amortizing open/close over the I/O rounds makes the measurement
+reflect how well operations on *different files* proceed in parallel -- the
+thing this lab asks you to make scale -- rather than the necessarily-shared
+fd table. Timing starts at a barrier after all 8 threads exist, so thread
+startup cost is excluded. One "op" in every reported number is one SFS API
+call. The benchmark is **sampled 5 times and the median ops/sec is scored**,
 mirroring what `make baseline` does for calibration -- this keeps the numerator
 and denominator of your ratio on the same statistical footing. A `spread`
 percentage is printed (200 x (max - min) / (max + min)); the autograder also
@@ -338,27 +363,52 @@ mutex) measured on the same machine via `make baseline`. Let
 
 | ratio | Score | Interpretation |
 |-------|-------|----------------|
-| >= 0.90 | 10/10 | At or near fine-grained locking |
-| >= 0.70 | 9/10  | Clearly better than coarse lock |
-| >= 0.50 | 7/10  | Moderate improvement |
-| >= 0.30 | 5/10  | Small improvement |
-| >= 0.15 | 3/10  | Roughly coarse-lock territory |
-| < 0.15 | 0/10  | Slower than the naive baseline |
+| >= 2.50 | 10/10 | Scaling that requires fine-grained locking |
+| >= 1.80 | 9/10  | Strong parallelism |
+| >= 1.40 | 7/10  | Meaningful parallelism |
+| >= 1.20 | 5/10  | Slightly better than one global lock |
+| >= 0.85 | 3/10  | Coarse-lock territory (this *is* the baseline) |
+| < 0.85 | 0/10  | Slower than the naive baseline |
 
-If `.perf_baseline` is missing, the grader falls back to the legacy absolute
-ops/sec thresholds and prints a warning telling you to run `make baseline`.
+These bars are calibrated against real implementations (see
+`docs/maintainer/PERF_CALIBRATION.md` for the measurements): a correct
+solution that keeps one global mutex measures ~1.0x and earns 3/10, while a
+per-file locking scheme measures ~4.5-5x on an 8-hardware-thread machine and
+clears 10/10 with a wide margin. The 2.5x bar is deliberately below what
+per-file locking achieves even on a 4-core machine, so full marks stay
+reachable on small CPUs.
+
+If `.perf_baseline` is missing -- or records a different grader workload
+version than this grader measures (the file carries a `WORKLOAD=` tag so a
+stale calibration is rejected instead of producing a meaningless ratio) --
+the grader falls back to absolute throughput **capped at 5/10** and tells you
+to re-run `make baseline`. Full performance credit always requires a
+calibrated ratio.
 
 Each Category C trace uses its own disk image and the parent cleans up
 concurrency images after timeout/crash paths, which keeps repeated stress runs
 from inheriting leftover state from the previous trace.
 
+**Failure disk images:** when a trace fails, the autograder snapshots the
+trace's surviving disk image(s) as `fail_<trace>_<image>.img` next to the
+originals and prints the path, so you can inspect the exact corrupted state
+with `./sfs-fsck --dump fail_B01_test.img` (Section 5.2) instead of
+re-running under a debugger. The copies are skipped in `--json`/`--tsan-only`
+runs and can be forced on/off with `SFS_KEEP_FAILED_DISKS=1/0`; `make clean`
+removes them along with the other images.
+
 `make stress` is for testing an implementation after you start fixing
 concurrency. It repeats the scored C concurrency traces and then runs
-stress-only diagnostics such as concurrent directory churn while another thread
-lists. These diagnostics are intentionally outside the 22-point score because
-they are more schedule-sensitive than the core correctness signal. `make
-stress` is stricter than the starter health check, and the unmodified skeleton
-may fail it.
+stress-only diagnostics: **S00** (directory churn while another thread lists)
+and **S01** (rename atomicity: a writer loops `rename("incoming", "stable")`
+while observers repeatedly open and read `"stable"` -- if an observer ever
+sees the file empty, the rename exposed a window in which the destination
+name did not exist, which the specification forbids; see the FAQ). These
+diagnostics are intentionally outside the 22-point score because they are
+more schedule-sensitive than the core correctness signal. `make stress` is
+stricter than the starter health check, and the unmodified skeleton
+may fail it (S01 exercises `sfs_rename`, which the starter has not
+implemented yet).
 
 **Deadlock protection:** Each Category C trace runs in a forked child with a
 30-second wall-clock budget; the perf benchmark gets 60 seconds. If a child
@@ -373,7 +423,8 @@ image. This is useful for debugging: if your implementation corrupts the on-disk
 
 ```bash
 ./sfs-fsck test.img
-./sfs-fsck -v test.img    # verbose output
+./sfs-fsck -v test.img       # verbose output
+./sfs-fsck --dump test.img   # human-readable image dump, then the checks
 ```
 
 It checks for:
@@ -385,6 +436,15 @@ It checks for:
 - Circular linked lists
 - Blocks on more than one list simultaneously
 - Orphaned blocks (not on any list)
+
+`--dump` (`-d`) prints what the image actually contains before judging it:
+the superblock summary, the free list chain, every directory entry with its
+block chain and size, and a per-type block tally. The dump is deliberately
+defensive -- chains are walked with a step cap, out-of-range block IDs are
+annotated instead of crashing, and long chains are elided -- so it stays
+useful on precisely the corrupted images you will want to point it at, such
+as the `fail_<trace>_*.img` snapshots the autograder keeps for failing
+traces (Section 5.1).
 
 ### 5.3 Concurrency Testing
 
@@ -400,6 +460,7 @@ gcc -std=c11 -g -fsanitize=thread -pthread -D_GNU_SOURCE=1 \
     -I. -o test-sfs-tsan local/test-sfs.c local/test-report.c \
     sfs-disk.c sfs-support.c
 ./test-sfs-tsan --tsan-only
+./test-sfs-tsan --tsan-only --sched-fuzz=2   # replay the seed the grader reported
 ```
 
 ThreadSanitizer will print the exact locations of any data races it detects. This is the
@@ -420,9 +481,10 @@ bug in your implementation. The 5-sample median absorbs most of this. If you
 still see the "spread exceeds 20%" warning, pick one (easiest first):
 
 1. **Move the disk images off the bind mount** with the `SFS_DISK_DIR` env
-   var. The three disk images (`test.img`, `test_conc.img`, `test_perf.img`)
-   dominate I/O cost; pointing them at the container's overlay FS (`/tmp`)
-   keeps them off the Windows bind mount entirely:
+   var. The disk images (`test.img`, the `test_conc_*.img` family,
+   `test_model.img`, `test_perf.img`) dominate I/O cost; pointing them at
+   the container's overlay FS (`/tmp`) keeps them off the Windows bind
+   mount entirely:
    ```bash
    export SFS_DISK_DIR=/tmp
    make baseline          # recalibrate in the new location
@@ -457,6 +519,26 @@ Fixes, easiest first:
 2. Restart the container (`docker restart <name>` from the host, then re-enter).
 3. Long-term, move the project off the Windows bind mount (option 4 above).
 
+### 5.5 Differential model fuzz
+
+`make model-fuzz` (or `./test-sfs --model-fuzz[=SEED]`) runs a seeded random
+sequence of ~2000 operations in lockstep against your implementation and a
+small in-memory reference model, comparing every return value, every byte
+read, and the directory listing. Every 250 operations it closes all files,
+unmounts, runs `sfs-fsck` on the image, and remounts. The disk is a single
+page -- the smallest image `sfs_format` accepts -- so `ENOSPC` paths are
+exercised for real.
+
+This is a *diagnostic*, not part of the 22-point score, but it is very good
+at catching the long tail the fixed traces cannot enumerate: off-by-one
+positions at block boundaries, wrong error codes, size accounting drift.
+On a mismatch it prints the seed, the operation number, and a log of the
+most recent operations; the same seed replays the identical sequence
+(`make model-fuzz MODEL_FUZZ_SEED=N`). The three unimplemented starter
+functions are treated as no-ops (counted and noted), so the fuzz is usable
+from your first build onward. `make report-json` includes a fixed-seed
+model-fuzz section so reports stay reproducible.
+
 ## 6 Concurrency Guide
 
 Once the three basic functions are implemented, the next challenge is making the file system
@@ -466,17 +548,25 @@ thread-safe. Here is a suggested progression:
 
 Start by adding a single global mutex that protects the entire file system. Lock it at the
 beginning of every API function and unlock it at the end. This ensures correctness but allows
-no concurrency.
+no concurrency -- it is exactly what the `test-sfs-baseline` reference does, so expect a perf
+ratio near 1.0x and a performance score of 3/10. That is the intended first checkpoint, not
+the destination.
 
 ### 6.2 Reader-Writer Locks
 
-Reading does not modify file data (only the file descriptor's position), so multiple readers can
-proceed concurrently. Use `pthread_rwlock_t` to allow concurrent reads while serializing writes.
+`pthread_rwlock_t` lets multiple readers proceed concurrently while writers get exclusivity.
+Be careful about where it actually helps, though: `sfs_read` *advances the file descriptor's
+position*, so on its own a single global rwlock buys almost nothing on the scored workload --
+nearly every operation still needs the write side. Reader-writer locks pay off for structures
+that are genuinely read-mostly, such as the directory during name lookups, usually in
+combination with the per-file locks of Section 6.3.
 
 ### 6.3 Per-File Locking
 
 Accesses to separate files should not block each other. Consider a lock per open file (or per
-directory entry) so that operations on different files can proceed in parallel.
+directory entry) so that operations on different files can proceed in parallel. This is the
+level of granularity the performance score is calibrated around; getting it right (plus
+short critical sections on the shared structures below) is what clears the 10/10 bar.
 
 ### 6.4 Tips
 
@@ -484,7 +574,50 @@ directory entry) so that operations on different files can proceed in parallel.
 - Use `sfs-fsck` after concurrent tests to verify disk image integrity.
 - ThreadSanitizer (`-fsanitize=thread`) is your best friend for finding races.
 - Be careful with operations that touch global state: the free list, the directory, and the
-  open file tables.
+  open file tables. Each can have its own small lock -- but fix a global lock *order* and
+  stick to it everywhere, or two threads taking the same locks in opposite orders will
+  deadlock (the 30-second trace timeout will catch you, but the report is less helpful
+  than a design that cannot deadlock).
+- After any locking change, run `make stress` and `make model-fuzz`, not just `./test-sfs`.
+
+## 7 Optional challenges (X traces)
+
+The handout source contains three "optional challenge" comments (in
+`createFile`, `sfs_open`, and `sfs_remove` in `sfs-disk.c`). Each now has a
+matching **X trace** that tells you whether you actually pulled it off. They
+are deliberately *not* part of the 22-point score: the default `./test-sfs`
+run shows them after the scoreboard as achieved (`PASS`) or not (`--`)
+without affecting your total or the exit status, and they never appear in
+`--list-traces`. For full diagnostics and kept failure images, run:
+
+```bash
+make x-traces          # = ./test-sfs --x-only
+```
+
+- **X00 `empty_file_blocks`** -- make empty files consume *zero* data blocks
+  (today every file occupies at least one block so a nonzero `first_block`
+  can mark the entry live). The trace creates 5 empty files on a minimal
+  one-page disk and then grows another file to use **every** data block --
+  which only fits if the empty files are block-free. Note that the on-disk
+  convention for "this entry is live" must change, so this trace skips the
+  `sfs-fsck` pass and you should update `sfs-fsck.c` to match your new
+  convention (the checker's directory-entry rules are written assuming the
+  old one).
+- **X01 `dir_expansion`** -- allow more than `DIR_ENTRIES_PER_BLOCK` (15)
+  files by chaining additional directory blocks from the superblock
+  (`next_rootdir` is already in the format, and `sfs-fsck` already walks
+  it). The trace creates 20 files, lists them all, spot-checks contents,
+  and requires a clean fsck afterwards.
+- **X02 `unix_remove`** -- implement Unix delete semantics: removing an open
+  file succeeds, the name disappears from the directory immediately, the
+  surviving fd can still read and write, re-opening the name creates a
+  distinct new file, and the storage is reclaimed once the last fd closes
+  (fsck must find no orphaned blocks). **Heads up:** this deliberately
+  contradicts the graded B02 trace, which encodes the handout's documented
+  `-EBUSY` behavior. Achieving X02 means giving up that B02 expectation --
+  treat it as a post-grading exploration (or keep it on a branch), exactly
+  the kind of design trade-off the comment in `sfs_remove` is inviting you
+  to think about.
 
 ## Appendix: FAQ
 
@@ -511,4 +644,6 @@ different from the Unix `lseek` system call.
 Yes. If `new_name` already exists, the replacement should be atomic -- there should be no gap
 in which a concurrent thread can observe `new_name` not existing. For the single-threaded
 implementation this is straightforward; for the concurrent version, you will need appropriate
-locking.
+locking. The S01 stress diagnostic (`make stress`, Section 5.1) hunts for exactly this gap:
+its observers open-and-read the rename destination in a loop and flag any moment the name
+resolved to a freshly created empty file.
