@@ -189,6 +189,14 @@ static void freeBlocks(block_id first_block)
         b = accessBlock(b->next_block);
     }
     b->next_block = superBlock->freelist;
+    if (superBlock->freelist != 0)
+    {
+        // The free list is doubly linked (sfs-fsck checks this), so the
+        // old head's prev pointer must be re-aimed at the chain we are
+        // prepending; otherwise the list is left inconsistent.
+        sfs_block_hdr_t *oldHead = accessFreeBlock(superBlock->freelist);
+        oldHead->prev_block = idOfBlock(b);
+    }
     superBlock->freelist = first_block;
 }
 
