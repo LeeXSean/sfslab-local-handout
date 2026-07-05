@@ -802,20 +802,33 @@ static int trace_B02(void)
           "read after seek to 0: data mismatch");
     sfs_close(fd);
 
-    /* fd-table exhaustion: the handout's OPEN_FILE_LIMIT (sfs-disk.c)
-       is 32.  All 32 descriptors may refer to the same file; #33 fails. */
-    int fds[32];
-    for (int i = 0; i < 32; i++)
+    /* fd-table exhaustion.  The handout's OPEN_FILE_LIMIT (sfs-disk.c)
+       is 32, but sfs-api.h does not pin the table size, so enlarging it
+       is a legitimate improvement.  The contract tested here is: at
+       least 32 simultaneous opens of one file succeed, and running out
+       of descriptors -- if it ever happens -- is reported as -EMFILE.
+       (The handout hits that at open #33.) */
+    enum { FD_PROBE_MAX = 64 };
+    int fds[FD_PROBE_MAX];
+    int n_open = 0;
+    int probe_err = 0;
+    for (int i = 0; i < FD_PROBE_MAX; i++)
     {
-        fds[i] = sfs_open("many");
-        CHECK(fds[i] >= 0, "open #%d of \"many\" returned %d", i + 1,
-              fds[i]);
+        int pfd = sfs_open("many");
+        if (pfd < 0)
+        {
+            probe_err = pfd;
+            break;
+        }
+        fds[n_open++] = pfd;
     }
-    r = sfs_open("many");
-    CHECK(r == -EMFILE,
-          "open #33 with a full descriptor table should be -EMFILE, got %d",
-          r);
-    for (int i = 0; i < 32; i++)
+    CHECK(n_open >= 32,
+          "at least 32 simultaneous opens should succeed; open #%d "
+          "failed with %d", n_open + 1, probe_err);
+    CHECK(n_open == FD_PROBE_MAX || probe_err == -EMFILE,
+          "running out of descriptors should report -EMFILE, got %d",
+          probe_err);
+    for (int i = 0; i < n_open; i++)
         sfs_close(fds[i]);
     r = sfs_remove("many");
     CHECK(r == 0, "remove(\"many\") after closing all fds returned %d", r);
@@ -946,6 +959,19 @@ static int trace_B03(void)
     cookie = NULL;
     CHECK(sfs_list(&cookie, name, 0) == -EINVAL,
           "list with zero filename_space should return -EINVAL");
+
+    /* sfs-api.h: whenever sfs_list returns nonzero -- errors included --
+       it also resets the cookie to NULL.  Exercise that from a *live*
+       cookie: one successful call first, then force an error. */
+    cookie = NULL;
+    r = sfs_list(&cookie, name, sizeof name);
+    CHECK(r == 0, "list first call should return a name, got %d", r);
+    CHECK(cookie != NULL, "cookie should be non-NULL mid-iteration");
+    r = sfs_list(&cookie, name, 0);
+    CHECK(r == -EINVAL, "mid-iteration error should be -EINVAL, got %d", r);
+    CHECK(cookie == NULL,
+          "cookie must be reset to NULL on a nonzero return (still %p)",
+          cookie);
 
     unmount_and_check(DISK_NAME);
     return trace_ok;
@@ -1429,6 +1455,12 @@ static int trace_C02(void)
 
 static pthread_barrier_t perf_barrier;
 
+/* Set by any perf worker that observes a wrong return value or wrong
+   bytes.  The scored benchmark refuses to award points once this fires,
+   so an implementation that shortcuts the perf path (right speed, wrong
+   results) earns 0/10 rather than a ratio. */
+static _Atomic int perf_worker_failed;
+
 static void *perf_worker(void *arg)
 {
     int id = *(int *)arg;
@@ -1440,16 +1472,46 @@ static void *perf_worker(void *arg)
     {
         int fd = sfs_open(fname);
         if (fd < 0)
+        {
+            atomic_store_explicit(&perf_worker_failed, 1,
+                                  memory_order_relaxed);
             continue;
+        }
+        ssize_t prev_nr = 0;
         for (int k = 0; k < PERF_IO_ROUNDS; k++)
         {
             char data[64];
             int len = snprintf(data, sizeof data, "iter-%d-%d-%d", id, i, k);
-            sfs_write(fd, data, (size_t)len);
-            sfs_seek(fd, -sfs_getpos(fd));
+            ssize_t nw = sfs_write(fd, data, (size_t)len);
+            ssize_t pos = sfs_getpos(fd);
+            ssize_t sk = sfs_seek(fd, -pos);
             char buf[64];
-            sfs_read(fd, buf, sizeof buf);
+            ssize_t nr = sfs_read(fd, buf, sizeof buf);
+
+            /* Validate as we go.  Each round: the write lands at the
+               position the previous read left (0 for round 0, since
+               open resets the position), the seek returns to 0, and
+               the read must cover at least the bytes just written.
+               Round 0 wrote at offset 0, so there the read-back bytes
+               are compared too.  The calibration baseline's getpos and
+               seek are -ENOSYS stubs; position checks are skipped in
+               that case, which cannot happen in a scored run because
+               correctness (A02/A03) gates the benchmark. */
+            if (nw != (ssize_t)len)
+                goto bad;
+            if (pos != -ENOSYS)
+            {
+                if (pos != prev_nr + nw || sk != 0 || nr < nw)
+                    goto bad;
+                if (k == 0 && memcmp(buf, data, (size_t)len) != 0)
+                    goto bad;
+                prev_nr = nr;
+            }
         }
+        sfs_close(fd);
+        continue;
+    bad:
+        atomic_store_explicit(&perf_worker_failed, 1, memory_order_relaxed);
         sfs_close(fd);
     }
     return NULL;
@@ -1672,6 +1734,14 @@ static int run_perf_benchmark(void)
         fflush(stdout);
     }
 
+    if (atomic_load_explicit(&perf_worker_failed, memory_order_relaxed))
+    {
+        printf("  Perf workload returned wrong results (bad return value, "
+               "position, or data\n  mismatch during the benchmark) -- "
+               "performance score set to 0.\n");
+        return 0;
+    }
+
     qsort(samples, PERF_SAMPLE_RUNS, sizeof samples[0], cmp_double_asc);
     double median = samples[PERF_SAMPLE_RUNS / 2];
     double lo = samples[0];
@@ -1736,6 +1806,9 @@ static enum tsan_result run_tsan_check(void)
     {
         printf("  (skipped -- TSan compilation failed, gcc may not support "
                "-fsanitize=thread)\n");
+        printf("  Note: without TSan, the C score reflects functional checks "
+               "only; races are\n  unverified.  Rerun on a TSan-capable "
+               "machine before trusting it.\n");
         unlink(tsan_bin);
         return TSAN_UNAVAILABLE; // don't penalize if TSan unavailable
     }
@@ -1771,6 +1844,9 @@ static enum tsan_result run_tsan_check(void)
                    "environment;\n"
                    "   kernel ASLR is incompatible with this TSan build. "
                    "Try 'sudo sysctl vm.mmap_rnd_bits=28'.)\n");
+            printf("  Note: without TSan, the C score reflects functional "
+                   "checks only; races are\n  unverified.  Rerun on a "
+                   "TSan-capable machine before trusting it.\n");
             result = TSAN_UNAVAILABLE;
             break;
         }
@@ -2096,6 +2172,9 @@ int main(int argc, char *argv[])
     {
         double baseline_ops = run_perf_benchmark_raw();
         printf("%.2f\n", baseline_ops);
+        if (atomic_load_explicit(&perf_worker_failed, memory_order_relaxed))
+            fprintf(stderr, "warning: perf workload self-checks failed; "
+                    "this number is not meaningful\n");
         unlink(DISK_NAME);
         return 0;
     }
@@ -2224,5 +2303,9 @@ int main(int argc, char *argv[])
     printf("========================================\n");
 
     unlink(DISK_NAME);
+    /* Deliberate contract: the exit status is the *correctness* gate
+       (12/12 -> 0), so scripts can distinguish "implementation complete"
+       from "still failing traces".  The performance score never changes
+       the exit status; read it from the scoreboard. */
     return (correctness == 12) ? 0 : 1;
 }

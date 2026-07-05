@@ -495,7 +495,10 @@ Category C score is set to 0, even though the normal traces passed.  The
 failing seed is reported so you can replay it (Section 7.3).
 .PP
 If your system cannot run ThreadSanitizer at all, the check is skipped
-without penalty.
+without penalty \(em but understand what that means: the serialized C
+traces alone cannot see data races, so on such a machine the Category C
+score is a functional signal only.  The driver says so when it skips;
+rerun on a TSan-capable machine before trusting the concurrency score.
 .SUB "Performance (10 points)"
 .PP
 The performance benchmark runs only after correctness is 12/12.  It starts
@@ -508,6 +511,12 @@ then 10 rounds of write/seek/getpos/read, then one
 \(em 672,000 API calls per run in total.  Timing starts at a barrier after
 all threads exist, so thread startup is excluded; the benchmark is sampled
 5 times and the median ops/sec is scored.
+.PP
+The workload validates its own results as it runs: every return value is
+checked against the position the descriptor must be at, and each session's
+first read is compared against the bytes just written.  If any check
+fails, the performance score is 0 \(em an implementation that is fast but
+wrong on the benchmark path earns nothing.
 .PP
 Raw throughput is machine-dependent, so the score is a ratio against the
 provided baseline (the handout implementation under one global mutex),
@@ -572,7 +581,9 @@ verbosity:
 suppresses per-check FAIL detail (scoreboard only), and
 .CW \-v
 raises the per-trace detail cap (by default only the first 3 failed checks
-per trace are printed).
+per trace are printed).  The exit status is the correctness gate: 0 once
+all twelve correctness traces pass, 1 otherwise.  The performance score
+never affects the exit status; read it from the scoreboard.
 .PP
 When a trace fails, the driver saves a copy of the trace's surviving disk
 image(s) under
