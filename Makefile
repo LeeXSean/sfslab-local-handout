@@ -16,9 +16,11 @@ test:
 clean:
 	$(MAKE) -C $(HANDOUT) clean
 
-# Rebuild the handout tarball deterministically (requires GNU tar).
+# Rebuild the handout tarball deterministically from committed files
+# (requires GNU tar).
 .PHONY: dist
-dist: sfslab.pdf
+dist:
+	test -f sfslab.pdf
 	$(MAKE) -C $(HANDOUT) clean
 	@tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/sfslab-dist.XXXXXX"); \
 	trap 'rm -rf "$$tmp"' EXIT HUP INT TERM; \
