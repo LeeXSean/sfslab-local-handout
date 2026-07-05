@@ -1,14 +1,21 @@
 CMU15213-SFS-Lab-main/
 
-# Local build outputs
+# Build outputs
 *.o
+sfslab/sfs-fsck
+sfslab/test-sfs
+sfslab/test-sfs-baseline
+sfslab/test-sfs-tsan
+
+# Disk images and grader outputs
 *.img
-*.log
-*.tmp
-test-sfs
-test-sfs-baseline
-sfs-fsck
-test-sfs-tsan
-.perf_baseline
-.perf_baseline.tmp
-.compare-starter-report.*/
+tsan_output.log
+sfslab/.perf_baseline
+sfslab/.perf_baseline.tmp
+
+# Editor detritus
+.*.sw[a-p]
+*~
+.DS_Store
+compile_commands.json
+.cache/

@@ -1,65 +1,64 @@
 #####################################################################
-# SFS Lab
+# SFS Lab: Writing a Multithreaded File System
 #
-# Student handout directory
+# Student handout files
 #####################################################################
 
-This directory contains the files needed to work through the SFS lab. It is
-arranged as a handout-style working directory: start here, edit `sfs-disk.c`,
-and use the provided tools to test your work.
+For a full description of the lab, see the writeup (sfslab.pdf),
+which is distributed alongside this tarball.
 
-Start here. For the normal student workflow, you only need this file,
-`SFS_Lab_Writeup.md`, `sfs-api.h`, and the file you edit:
+***********
+Main files:
+***********
 
-    sfs-disk.c
+sfs-disk.c
+        The SFS implementation.  This is the only file you need to
+        edit.  It contains three unimplemented functions (sfs_getpos,
+        sfs_seek, sfs_rename) and, once those work, it is where you
+        add locking to make the file system thread-safe and scalable.
 
-Repository-level `docs/` files, JSON schema notes, trace internals, and
-maintainer notes are optional background. You do not need them to complete the
-lab.
+sfs-api.h
+        The API specification you are implementing.  Read the doc
+        comment above each function carefully.  Do not modify.
 
-Provided support files:
+test-sfs.c
+        The test driver and autograder.  Type "make test" (or run
+        ./test-sfs) to score your work.
 
-    sfs-api.h       API specification for sfs-disk.c.
-    sfs-disk.h      On-disk data structures and constants.
-    sfs-support.c   Low-level disk image and mmap support.
-    sfs-fsck.c      Filesystem consistency checker.
+**********************************
+Other support files for the driver
+**********************************
 
-Suggested order:
+sfs-disk.h          On-disk data structures and constants.
+sfs-support.c       Low-level disk image and mmap support.
+sfs-fsck.c          File system consistency checker (./sfs-fsck).
+sfs-baseline-ref.c  Handout code under one global mutex; used by
+                    "make baseline" to calibrate the performance
+                    score for your machine.  Do not modify.
+Makefile            Builds sfs-fsck, test-sfs, and test-sfs-baseline.
+.clang-format       Formatting configuration matching the handout style.
 
-    1. Run `make check` once to confirm the handout and tools are working.
-    2. Read `SFS_Lab_Writeup.md`.
-    3. Read the `sfs_getpos`, `sfs_seek`, and `sfs_rename` comments in
-       `sfs-api.h`.
-    4. Edit only `sfs-disk.c`.
-    5. Run `make test` after each change.
-    6. Work through Category A, then B, then C.
-    7. Tune performance only after correctness reaches 12/12. Use
-       `make grade` (it calibrates `.perf_baseline` first); without a
-       calibrated baseline the performance score is capped at 5/10.
+*******************************
+Building and running the driver
+*******************************
 
-Main test command:
+To build the driver, type:
 
-    make test         Run the local autograder.
+    unix> make
 
-Setup and cleanup commands:
+To run the autograder:
 
-    make check        Run once before starting, or when the handout looks broken.
-    make clean        Remove generated files.
+    unix> ./test-sfs
 
-Optional score details:
+The unmodified handout is expected to fail some traces: sfs_getpos,
+sfs_seek, and sfs_rename are intentionally left for you to implement.
 
-    make json         Print the local 22-point score as JSON.
+Before reading anything into the performance score, calibrate the
+baseline for your machine (once per machine, and again after the
+machine changes):
 
-Optional diagnostics (useful once you start the concurrency work; none of
-these change the 22-point score):
+    unix> make baseline
 
-    make stress       Repeat the concurrency traces plus stress diagnostics.
-    make model-fuzz   Random differential test against a reference model.
-    make x-traces     The optional X challenges from the sfs-disk.c comments.
-
-The unmodified starter is expected to fail the full autograder because some
-functions are intentionally left for you to implement. `make check` passing
-means the package is healthy; `make test` is the command for your progress.
-
-SCORING.md explains how to read the local score if you want more detail. The
-local score is a self-study signal, not an Autolab prediction.
+"make grade" runs the calibration and the autograder in one step.
+Run everything from this directory; the driver expects ./sfs-fsck
+and ./.perf_baseline to be reachable from the working directory.

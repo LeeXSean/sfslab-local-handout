@@ -667,14 +667,20 @@ int sfs_list(sfs_list_cookie *cookie, char filename_out[],
     BASELINE_LOCK();
     int rv;
 
+    // The API promises that whenever this function returns a nonzero
+    // status -- errors included -- the cookie is reset to NULL, so a
+    // caller can always start a fresh loop afterward.
+
     // Corner case: If filename_space is zero, we cannot produce
     // an empty string into it on error.
     if (filename_space == 0) {
+        *cookie = NULL;
         rv = -EINVAL;
         goto out;
     }
 
     if (getSFSStatus() < 0) {
+        *cookie = NULL;
         rv = -ENOMEDIUM;
         goto out;
     }
@@ -696,6 +702,7 @@ int sfs_list(sfs_list_cookie *cookie, char filename_out[],
             size_t len = strlen(e->name);
             if (len + 1 > filename_space)
             {
+                *cookie = NULL;
                 rv = -ENAMETOOLONG;
                 goto out;
             }

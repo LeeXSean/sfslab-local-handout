@@ -6,8 +6,8 @@ release and is not affiliated with Carnegie Mellon University or the course
 staff.
 
 Original SFS lab materials belong to Carnegie Mellon University and the
-15-213 / 15-513 course staff. The local packaging, checks, diagnostic scripts,
-and documentation in this repository are provided to make self-study possible
+15-213 / 15-513 course staff. The local packaging, test driver, writeup, and
+documentation in this repository are provided to make self-study possible
 without CMU-only infrastructure.
 
 Do not publish completed `sfs-disk.c` solutions or use this repository to

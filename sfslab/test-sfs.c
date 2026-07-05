@@ -1,19 +1,18 @@
 /*
- * test-sfs.c - SFS Lab Autograder (local, no Lua required)
+ * test-sfs.c - SFS Lab test driver and autograder
  *
- * Mirrors the original CMU grading structure:
- *   Category A (5 pts) - Feature tests
- *   Category B (4 pts) - Sequential correctness
- *   Category C (3 pts) - Concurrent correctness
- *   Performance  (10 pts) - Concurrent throughput benchmark
- *   Style        (4 pts) - Manual review (not auto-graded)
+ * Grading structure:
+ *   Category A  (5 pts)  - Feature tests
+ *   Category B  (4 pts)  - Sequential correctness
+ *   Category C  (3 pts)  - Concurrent correctness (plus a TSan race sweep)
+ *   Performance (10 pts) - Concurrent throughput vs. coarse-lock baseline
+ *   Style       (4 pts)  - Manual review (not auto-graded)
  *
- * Build:  make test-sfs
- * Run:    ./test-sfs
+ * Build:  make
+ * Run:    ./test-sfs     (from the handout directory)
  */
 
 #include "sfs-api.h"
-#include "test-report.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -35,17 +34,27 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Result of the ThreadSanitizer sweep (see run_tsan_check). */
+enum tsan_result
+{
+    TSAN_SKIPPED,      /* correctness gate not passed; TSan not attempted */
+    TSAN_CLEAN,        /* ran, no races */
+    TSAN_RACE,         /* data race detected */
+    TSAN_TRACE_FAILED, /* sanitized C traces failed functionally */
+    TSAN_UNAVAILABLE,  /* toolchain/environment cannot run TSan */
+    TSAN_TIMEOUT,      /* sanitized run exceeded its budget */
+};
+
 /* Disk image paths. Default to the current directory; override with
    SFS_DISK_DIR=/some/path (e.g. SFS_DISK_DIR=/tmp on Docker Desktop
-   to keep perf I/O off the bind mount -- see writeup Section 5.4). */
+   to keep perf I/O off the bind mount -- see the writeup's notes on
+   running inside Docker or WSL). */
 static const char *DISK_NAME = "test.img";
 static const char *CONC_DISK_C00 = "test_conc_C00.img";
 static const char *CONC_DISK_C01 = "test_conc_C01.img";
 static const char *CONC_DISK_C02_RW = "test_conc_C02_rw.img";
 static const char *CONC_DISK_C02_STORM = "test_conc_C02_storm.img";
 static const char *CONC_DISK_C02_DIR = "test_conc_C02_dir.img";
-static const char *CONC_DISK_S01 = "test_conc_S01.img";
-static const char *MODEL_DISK = "test_model.img";
 static const char *PERF_DISK = "test_perf.img";
 
 static char *sfs_join(const char *dir, const char *name)
@@ -72,8 +81,6 @@ static void init_disk_paths(void)
     CONC_DISK_C02_RW = sfs_join(dir, "test_conc_C02_rw.img");
     CONC_DISK_C02_STORM = sfs_join(dir, "test_conc_C02_storm.img");
     CONC_DISK_C02_DIR = sfs_join(dir, "test_conc_C02_dir.img");
-    CONC_DISK_S01 = sfs_join(dir, "test_conc_S01.img");
-    MODEL_DISK = sfs_join(dir, "test_model.img");
     PERF_DISK = sfs_join(dir, "test_perf.img");
     fprintf(stderr, "Disk images redirected via SFS_DISK_DIR: %s\n", dir);
 }
@@ -85,14 +92,12 @@ static void cleanup_concurrency_disks(void)
     unlink(CONC_DISK_C02_RW);
     unlink(CONC_DISK_C02_STORM);
     unlink(CONC_DISK_C02_DIR);
-    unlink(CONC_DISK_S01);
-    unlink(MODEL_DISK);
 }
 
 /* Keep a copy of a failing trace's disk image(s) for post-mortem fsck.
-   On by default for human runs; off under --json and --tsan-only so
-   report generation stays clean.  SFS_KEEP_FAILED_DISKS=0/1 overrides.
-   The copies match the *.img cleanup globs (make clean, .gitignore). */
+   On by default for human runs; off under --tsan-only so the sanitizer
+   sweep stays clean.  SFS_KEEP_FAILED_DISKS=0/1 overrides.
+   The copies match the *.img cleanup glob (make clean). */
 static int keep_failed_disks;
 static int quiet_mode;   /* -q: suppress all FAIL detail output */
 
@@ -142,29 +147,19 @@ static char *keep_failure_images(const char *id)
 {
     if (!keep_failed_disks)
         return NULL;
-    /* X traces are optional: in the quiet default run a not-achieved X
-       trace is the normal state, not a failure worth keeping artifacts
-       for.  --x-only runs them with detail and does keep images. */
-    if (id[0] == 'X' && quiet_mode)
-        return NULL;
 
-    /* A/B/X traces share DISK_NAME; C and stress traces use their own
-       images.  Restrict candidates so a leftover test.img from an earlier
+    /* A/B traces share DISK_NAME; C traces use their own images.
+       Restrict candidates so a leftover test.img from an earlier
        category is not misattributed to a concurrent trace. */
-    const char *cands[6];
+    const char *cands[5];
     size_t n_cands = 0;
-    if (id[0] == 'C' || id[0] == 'S')
+    if (id[0] == 'C')
     {
         cands[n_cands++] = CONC_DISK_C00;
         cands[n_cands++] = CONC_DISK_C01;
         cands[n_cands++] = CONC_DISK_C02_RW;
         cands[n_cands++] = CONC_DISK_C02_STORM;
         cands[n_cands++] = CONC_DISK_C02_DIR;
-        cands[n_cands++] = CONC_DISK_S01;
-    }
-    else if (id[0] == 'M')
-    {
-        cands[n_cands++] = MODEL_DISK;
     }
     else
     {
@@ -213,13 +208,12 @@ static char *keep_failure_images(const char *id)
 static int trace_ok;
 static _Atomic int trace_fail_count;   /* atomic: C traces increment from pthreads */
 static int trace_fail_limit = TRACE_FAIL_DETAIL_DEFAULT;  /* -v bumps to INT_MAX */
-static FILE *check_stream;             /* where CHECK writes FAIL diagnostics */
 
 /* Build the full "       -> FAIL ... \n" line into a local buffer, then emit
-   with a single fputs so concurrent threads writing to the same FILE (e.g.
-   the pipe back to the parent in forked C traces) can't interleave each
-   other's lines.  Pipe writes of <= PIPE_BUF bytes are atomic on Linux;
-   512 bytes is well within that. */
+   with a single fputs so concurrent threads writing to the same FILE (the
+   pipe back to the parent, since every trace runs in a forked child) can't
+   interleave each other's lines.  Pipe writes of <= PIPE_BUF bytes are
+   atomic on Linux; 512 bytes is well within that. */
 #define CHECK(cond, ...)                                                       \
     do                                                                         \
     {                                                                          \
@@ -242,9 +236,8 @@ static FILE *check_stream;             /* where CHECK writes FAIL diagnostics */
                     _k = (int)sizeof _lb - 2;                                  \
                 _lb[_k] = '\n';                                                \
                 _lb[_k + 1] = '\0';                                            \
-                FILE *_cs = check_stream ? check_stream : stderr;              \
-                fputs(_lb, _cs);                                               \
-                fflush(_cs);                                                   \
+                fputs(_lb, stderr);                                            \
+                fflush(stderr);                                                \
             }                                                                  \
         }                                                                      \
     } while (0)
@@ -809,6 +802,61 @@ static int trace_B02(void)
           "read after seek to 0: data mismatch");
     sfs_close(fd);
 
+    /* fd-table exhaustion: the handout's OPEN_FILE_LIMIT (sfs-disk.c)
+       is 32.  All 32 descriptors may refer to the same file; #33 fails. */
+    int fds[32];
+    for (int i = 0; i < 32; i++)
+    {
+        fds[i] = sfs_open("many");
+        CHECK(fds[i] >= 0, "open #%d of \"many\" returned %d", i + 1,
+              fds[i]);
+    }
+    r = sfs_open("many");
+    CHECK(r == -EMFILE,
+          "open #33 with a full descriptor table should be -EMFILE, got %d",
+          r);
+    for (int i = 0; i < 32; i++)
+        sfs_close(fds[i]);
+    r = sfs_remove("many");
+    CHECK(r == 0, "remove(\"many\") after closing all fds returned %d", r);
+
+    unmount_and_check(DISK_NAME);
+
+    /* disk-space exhaustion, on the smallest image sfs_format accepts:
+       one page holds pagesize/512 blocks, one of which is the superblock.
+       A file's first block comes with creation; each further 500-byte
+       write allocates exactly one more. */
+    size_t pagesz = (size_t)sysconf(_SC_PAGESIZE);
+    size_t data_blocks = pagesz / 512 - 1;
+    r = sfs_format(DISK_NAME, pagesz);
+    CHECK(r == 0, "sfs_format(one page) returned %d", r);
+
+    fd = sfs_open("big");
+    CHECK(fd >= 0, "open(\"big\") on the tiny disk returned %d", fd);
+    for (size_t b = 0; b < data_blocks; b++)
+    {
+        nw = sfs_write(fd, fill, 500);
+        CHECK(nw == 500, "write filling block %zu of %zu returned %zd",
+              b + 1, data_blocks, nw);
+    }
+    nw = sfs_write(fd, fill, 500);
+    CHECK(nw == -ENOSPC, "write on a full disk should be -ENOSPC, got %zd",
+          nw);
+    int fdfull = sfs_open("nofit");
+    CHECK(fdfull == -ENOSPC,
+          "creating a file on a full disk should be -ENOSPC, got %d",
+          fdfull);
+    sfs_close(fd);
+
+    /* removing the file frees its blocks again */
+    r = sfs_remove("big");
+    CHECK(r == 0, "remove(\"big\") returned %d", r);
+    fdfull = sfs_open("fits");
+    CHECK(fdfull >= 0, "open after freeing space returned %d", fdfull);
+    CHECK(sfs_write(fdfull, "ok", 2) == 2, "write after freeing space failed");
+    sfs_close(fdfull);
+    CHECK(sfs_remove("fits") == 0, "remove(\"fits\") returned nonzero");
+
     unmount_and_check(DISK_NAME);
     return trace_ok;
 }
@@ -1014,6 +1062,22 @@ static int c_sfs_list(sfs_list_cookie *cookie, char filename_out[],
     return ret;
 }
 
+static int c_sfs_remove(const char *name)
+{
+    c_api_enter();
+    int ret = sfs_remove(name);
+    c_api_leave();
+    return ret;
+}
+
+static int c_sfs_rename(const char *old_name, const char *new_name)
+{
+    c_api_enter();
+    int ret = sfs_rename(old_name, new_name);
+    c_api_leave();
+    return ret;
+}
+
 static void *thread_write_own_file(void *arg)
 {
     int id = *(int *)arg;
@@ -1168,62 +1232,68 @@ static void *thread_open_close_storm(void *arg)
     return NULL;
 }
 
-static _Atomic int dir_churn_start;
-static _Atomic int dir_churn_done;
+/* Part 3 of C02: directory churn.  Each churn thread repeatedly creates
+   its own file and then renames it onto a per-thread destination, so
+   iterations after the first exercise overwrite-rename while the lister
+   below walks the directory.  While sfs_rename is still the -ENOSYS
+   starter stub, the thread falls back to a plain remove, so the trace is
+   meaningful (and passes) before the stub is implemented.  All names are
+   per-thread, which keeps the serialized run deterministic; under the
+   TSan rerun this same code makes real concurrent create/rename/remove
+   calls. */
+#define CHURN_ITERS 12
 
-static void wait_dir_churn_start(void)
-{
-    while (!atomic_load_explicit(&dir_churn_start, memory_order_acquire))
-        sched_yield();
-}
+static _Atomic int churn_done;
 
 static void *thread_dir_churn(void *arg)
 {
     int id = *(int *)arg;
-    wait_dir_churn_start();
+    char dst[SFS_FILE_NAME_SIZE_LIMIT];
+    snprintf(dst, sizeof dst, "stable%d", id);
+    int renamed = 0;
 
-    for (int i = 0; i < 20; i++)
+    for (int i = 0; i < CHURN_ITERS; i++)
     {
         char name[SFS_FILE_NAME_SIZE_LIMIT];
-        int n = snprintf(name, sizeof name, "dir%d_%02d", id, i);
-        if (n < 0 || (size_t)n >= sizeof name)
-            return (void *)(intptr_t)-1;
+        snprintf(name, sizeof name, "churn%d_%02d", id, i);
 
-        fuzz_point();
-        int fd = sfs_open(name);
+        int fd = c_sfs_open(name);
         if (fd < 0)
             return (void *)(intptr_t)-1;
-
         char data[32];
-        int len = snprintf(data, sizeof data, "dir-%d-%d", id, i);
-        fuzz_point();
-        if (len < 0 || sfs_write(fd, data, (size_t)len) != (ssize_t)len)
+        int len = snprintf(data, sizeof data, "c-%d-%d", id, i);
+        if (len < 0 || c_sfs_write(fd, data, (size_t)len) != (ssize_t)len)
         {
-            sfs_close(fd);
+            c_sfs_close(fd);
             return (void *)(intptr_t)-1;
         }
-        sfs_close(fd);
+        c_sfs_close(fd);
 
-        fuzz_point();
-        if (sfs_remove(name) != 0)
+        int r = c_sfs_rename(name, dst);
+        if (r == 0)
+            renamed = 1;
+        else if (r == -ENOSYS)
+        {
+            if (c_sfs_remove(name) != 0)
+                return (void *)(intptr_t)-1;
+        }
+        else
             return (void *)(intptr_t)-1;
-        sched_yield();
     }
+    if (renamed && c_sfs_remove(dst) != 0)
+        return (void *)(intptr_t)-1;
     return NULL;
 }
 
 static void *thread_list_during_churn(void *arg)
 {
-    wait_dir_churn_start();
-
     int passes = 0;
     do
     {
         sfs_list_cookie cookie = NULL;
         char name[SFS_FILE_NAME_SIZE_LIMIT];
         int status;
-        fuzz_point();
-        while ((status = sfs_list(&cookie, name, sizeof name)) == 0)
+        while ((status = c_sfs_list(&cookie, name, sizeof name)) == 0)
         {
             if (name[0] == '\0')
                 return (void *)(intptr_t)-1;
@@ -1232,13 +1302,12 @@ static void *thread_list_during_churn(void *arg)
             return (void *)(intptr_t)-1;
         passes++;
         sched_yield();
-    } while (!atomic_load_explicit(&dir_churn_done, memory_order_acquire) ||
+    } while (!atomic_load_explicit(&churn_done, memory_order_acquire) ||
              passes < 4);
-
     return NULL;
 }
 
-/* C02: mixed r/w + open/close stress */
+/* C02: mixed r/w + open/close storm + directory churn */
 static int trace_C02(void)
 {
     trace_ok = 1;
@@ -1288,1039 +1357,44 @@ static int trace_C02(void)
 
     unmount_and_check(CONC_DISK_C02_STORM);
     unlink(CONC_DISK_C02_STORM);
-    return trace_ok;
-}
 
-/* Stress-only: directory churn while another thread lists.
-   This is intentionally diagnostic rather than part of the 22-point score:
-   the workload is useful for shaking out unstable locking, but it is more
-   schedule-sensitive than the official-style C correctness signal. */
-static int trace_stress_dir_churn(void)
-{
-    trace_ok = 1;
+    /* Part 3: directory churn (create/rename/remove) under a live lister */
     sfs_format(CONC_DISK_C02_DIR, disk_size());
-    atomic_store_explicit(&dir_churn_start, 0, memory_order_release);
-    atomic_store_explicit(&dir_churn_done, 0, memory_order_release);
+    atomic_store_explicit(&churn_done, 0, memory_order_release);
 
     pthread_t lister;
-    pthread_t dir_threads[NUM_THREADS];
-    int dir_ids[NUM_THREADS];
+    int churn_ids[NUM_THREADS];
     pthread_create(&lister, NULL, thread_list_during_churn, NULL);
     for (int i = 0; i < NUM_THREADS; i++)
     {
-        dir_ids[i] = i;
-        pthread_create(&dir_threads[i], NULL, thread_dir_churn, &dir_ids[i]);
+        churn_ids[i] = i;
+        pthread_create(&threads[i], NULL, thread_dir_churn, &churn_ids[i]);
     }
-    atomic_store_explicit(&dir_churn_start, 1, memory_order_release);
 
-    int ok = 1;
+    ok = 1;
     for (int i = 0; i < NUM_THREADS; i++)
     {
         void *ret;
-        pthread_join(dir_threads[i], &ret);
+        pthread_join(threads[i], &ret);
         if (ret != NULL)
             ok = 0;
     }
-    atomic_store_explicit(&dir_churn_done, 1, memory_order_release);
-
+    atomic_store_explicit(&churn_done, 1, memory_order_release);
     void *list_ret;
     pthread_join(lister, &list_ret);
-    if (list_ret != NULL)
-        ok = 0;
-    CHECK(ok, "concurrent directory churn failed");
+    CHECK(ok, "directory churn (create/rename/remove) failed");
+    CHECK(list_ret == NULL, "listing during directory churn failed");
 
-    sfs_list_cookie cookie = NULL;
-    char name[SFS_FILE_NAME_SIZE_LIMIT];
-    int count = 0;
-    int status;
-    while ((status = sfs_list(&cookie, name, sizeof name)) == 0)
+    cookie = NULL;
+    count = 0;
+    while (c_sfs_list(&cookie, name, sizeof name) == 0)
         count++;
-    CHECK(status == 1, "final list returned %d", status);
-    CHECK(count == 0, "directory churn: expected 0 files, got %d", count);
+    CHECK(count == 0, "churn should leave no files, found %d", count);
 
     unmount_and_check(CONC_DISK_C02_DIR);
     unlink(CONC_DISK_C02_DIR);
     return trace_ok;
 }
-
-/* Stress-only: rename atomicity.
-   sfs-api.h promises that overwrite-rename leaves no window in which a
-   concurrent thread can observe new_name not existing.  sfs_open creates
-   missing files as empty, which makes it a natural gap detector: 'stable'
-   always carries payload bytes, so an observer that reads 0 bytes from it
-   can only have open()-created it inside a rename gap. */
-#define RENAME_ATOMIC_ITERS 150
-#define RENAME_OBSERVERS 3
-
-static _Atomic int rename_atomic_stop;
-static _Atomic int rename_atomic_gaps;
-static _Atomic int rename_atomic_writer_err;
-static _Atomic int rename_atomic_observer_err;
-
-static void *thread_rename_writer(void *arg)
-{
-    for (int i = 0; i < RENAME_ATOMIC_ITERS; i++)
-    {
-        fuzz_point();
-        int fd = sfs_open("incoming");
-        if (fd < 0)
-        {
-            atomic_store(&rename_atomic_writer_err, fd);
-            break;
-        }
-        char data[32];
-        int len = snprintf(data, sizeof data, "payload-%03d", i);
-        fuzz_point();
-        if (len < 0 || sfs_write(fd, data, (size_t)len) != (ssize_t)len)
-        {
-            sfs_close(fd);
-            atomic_store(&rename_atomic_writer_err, -EIO);
-            break;
-        }
-        sfs_close(fd);
-
-        /* -EBUSY only means an observer momentarily holds 'stable' open
-           (replacing an open file is the X02 optional challenge); retry. */
-        int r;
-        do
-        {
-            fuzz_point();
-            r = sfs_rename("incoming", "stable");
-            if (r == -EBUSY)
-                sched_yield();
-        } while (r == -EBUSY);
-        if (r != 0)
-        {
-            atomic_store(&rename_atomic_writer_err, r);
-            break;
-        }
-    }
-    atomic_store_explicit(&rename_atomic_stop, 1, memory_order_release);
-    return NULL;
-}
-
-static void *thread_rename_observer(void *arg)
-{
-    while (!atomic_load_explicit(&rename_atomic_stop, memory_order_acquire))
-    {
-        fuzz_point();
-        int fd = sfs_open("stable");
-        if (fd < 0)
-        {
-            atomic_store(&rename_atomic_observer_err, fd);
-            return NULL;
-        }
-        char buf[64];
-        fuzz_point();
-        ssize_t nr = sfs_read(fd, buf, sizeof buf);
-        sfs_close(fd);
-        if (nr == 0)
-            atomic_fetch_add(&rename_atomic_gaps, 1);
-        else if (nr < 0)
-        {
-            atomic_store(&rename_atomic_observer_err, (int)nr);
-            return NULL;
-        }
-        sched_yield();
-    }
-    return NULL;
-}
-
-static int trace_stress_rename_atomic(void)
-{
-    trace_ok = 1;
-    sfs_format(CONC_DISK_S01, disk_size());
-    atomic_store(&rename_atomic_stop, 0);
-    atomic_store(&rename_atomic_gaps, 0);
-    atomic_store(&rename_atomic_writer_err, 0);
-    atomic_store(&rename_atomic_observer_err, 0);
-
-    /* Seed 'stable' with payload before any observer looks at it. */
-    int fd = sfs_open("stable");
-    CHECK(fd >= 0, "initial open of 'stable' returned %d", fd);
-    CHECK(sfs_write(fd, "payload-init", 12) == 12, "seeding 'stable' failed");
-    sfs_close(fd);
-
-    pthread_t writer;
-    pthread_t observers[RENAME_OBSERVERS];
-    pthread_create(&writer, NULL, thread_rename_writer, NULL);
-    for (int i = 0; i < RENAME_OBSERVERS; i++)
-        pthread_create(&observers[i], NULL, thread_rename_observer, NULL);
-
-    pthread_join(writer, NULL);
-    for (int i = 0; i < RENAME_OBSERVERS; i++)
-        pthread_join(observers[i], NULL);
-
-    int werr = atomic_load(&rename_atomic_writer_err);
-    int oerr = atomic_load(&rename_atomic_observer_err);
-    int gaps = atomic_load(&rename_atomic_gaps);
-    CHECK(werr == 0, "rename writer failed with %d", werr);
-    CHECK(oerr == 0, "observer hit unexpected error %d", oerr);
-    CHECK(gaps == 0,
-          "observers saw 'stable' missing %d time(s): overwrite rename must "
-          "be atomic (no window where new_name does not exist)", gaps);
-
-    /* Final state: the last rename left exactly one file, 'stable',
-       holding the writer's last payload. */
-    fd = sfs_open("stable");
-    CHECK(fd >= 0, "final open of 'stable' returned %d", fd);
-    char buf[64] = {0};
-    ssize_t nr = sfs_read(fd, buf, sizeof buf);
-    char want[32];
-    int wantlen = snprintf(want, sizeof want, "payload-%03d",
-                           RENAME_ATOMIC_ITERS - 1);
-    CHECK(werr != 0 || (nr == wantlen && memcmp(buf, want, (size_t)wantlen) == 0),
-          "final 'stable' content mismatch: got %zd bytes '%.*s'",
-          nr, (int)(nr > 0 ? nr : 0), buf);
-    sfs_close(fd);
-
-    sfs_list_cookie cookie = NULL;
-    char name[SFS_FILE_NAME_SIZE_LIMIT];
-    int count = 0;
-    while (sfs_list(&cookie, name, sizeof name) == 0)
-        count++;
-    CHECK(count == 1, "expected only 'stable' to remain, found %d files",
-          count);
-
-    unmount_and_check(CONC_DISK_S01);
-    unlink(CONC_DISK_S01);
-    return trace_ok;
-}
-
-/* ================================================================== */
-/*  Category X -- Optional Challenges (not scored)                     */
-/* ================================================================== */
-
-/* These make the three "optional challenge" comments in sfs-disk.c (and
-   the X traces that sfs-disk.h alludes to) executable.  They are
-   exploration targets, not graded work: the scoreboard reports them as
-   achieved or not, and nothing here changes the 22-point score.  The
-   unmodified starter is expected to achieve none of them. */
-
-/* X00: empty files should consume no data blocks (see the createFile
-   comment in sfs-disk.c).  On a one-page disk with N data blocks,
-   create a few empty files and then grow one file to exactly N blocks;
-   that only fits if the empty files allocated nothing.  The handout
-   starter fails because every file occupies at least one block.
-
-   This trace skips sfs-fsck on purpose: implementing X00 changes the
-   "directory entry in use" rule, which requires a matching change in
-   sfs-fsck.c's check_directory_entries (see the comment there). */
-static int trace_X00(void)
-{
-    trace_ok = 1;
-    size_t disk_bytes = (size_t)sysconf(_SC_PAGESIZE);
-    size_t data_blocks = disk_bytes / 512u - 1; /* minus the superblock */
-
-    int r = sfs_format(DISK_NAME, disk_bytes);
-    CHECK(r == 0, "sfs_format(%zu) returned %d", disk_bytes, r);
-    if (r != 0)
-        return trace_ok;
-
-    for (int i = 0; i < 5; i++)
-    {
-        char name[SFS_FILE_NAME_SIZE_LIMIT];
-        snprintf(name, sizeof name, "empty%d", i);
-        int fd = sfs_open(name);
-        CHECK(fd >= 0, "open(\"%s\") returned %d", name, fd);
-        if (fd < 0)
-            goto out;
-        sfs_close(fd);
-    }
-
-    int fd = sfs_open("big");
-    CHECK(fd >= 0, "open(\"big\") returned %d", fd);
-    if (fd < 0)
-        goto out;
-    char chunk[500]; /* BLOCK_DATA_SIZE in sfs-disk.h */
-    memset(chunk, 'X', sizeof chunk);
-    for (size_t b = 0; b < data_blocks; b++)
-    {
-        ssize_t nw = sfs_write(fd, chunk, sizeof chunk);
-        CHECK(nw == (ssize_t)sizeof chunk,
-              "growing \"big\" to block %zu of %zu returned %zd "
-              "(zero-block empty files would have left room)",
-              b + 1, data_blocks, nw);
-        if (nw != (ssize_t)sizeof chunk)
-        {
-            sfs_close(fd);
-            goto out;
-        }
-    }
-    sfs_close(fd);
-
-    sfs_list_cookie cookie = NULL;
-    char lname[SFS_FILE_NAME_SIZE_LIMIT];
-    int count = 0;
-    while (sfs_list(&cookie, lname, sizeof lname) == 0)
-        count++;
-    CHECK(count == 6, "expected 6 files (5 empty + big), got %d", count);
-
-    fd = sfs_open("big");
-    char buf[8] = {0};
-    CHECK(fd >= 0 && sfs_read(fd, buf, 4) == 4 && memcmp(buf, "XXXX", 4) == 0,
-          "read-back of \"big\" failed");
-    sfs_close(fd);
-
-    for (int i = 0; i < 5; i++)
-    {
-        char name[SFS_FILE_NAME_SIZE_LIMIT];
-        snprintf(name, sizeof name, "empty%d", i);
-        CHECK(sfs_remove(name) == 0, "remove(\"%s\") failed", name);
-    }
-    CHECK(sfs_remove("big") == 0, "remove(\"big\") failed");
-
-out:
-    sfs_unmount(); /* no fsck here: see the header comment */
-    return trace_ok;
-}
-
-/* X01: the root directory should be able to grow past the superblock's
-   15 entries (see the sfs_open comment in sfs-disk.c).  sfs-fsck
-   already validates extended root-directory chains, so this trace keeps
-   the usual post-unmount consistency check.  The starter fails at file
-   16 with -ENOSPC. */
-#define X01_FILES 20
-static int trace_X01(void)
-{
-    trace_ok = 1;
-    sfs_format(DISK_NAME, disk_size());
-
-    for (int i = 0; i < X01_FILES; i++)
-    {
-        char name[SFS_FILE_NAME_SIZE_LIMIT];
-        snprintf(name, sizeof name, "ext%02d", i);
-        int fd = sfs_open(name);
-        CHECK(fd >= 0,
-              "open(\"%s\") returned %d (file %d of %d requires directory "
-              "expansion)", name, fd, i + 1, X01_FILES);
-        if (fd < 0)
-            goto out;
-        char c = (char)('a' + i % 26);
-        CHECK(sfs_write(fd, &c, 1) == 1, "write to \"%s\" failed", name);
-        sfs_close(fd);
-    }
-
-    char seen[X01_FILES] = {0};
-    sfs_list_cookie cookie = NULL;
-    char lname[SFS_FILE_NAME_SIZE_LIMIT];
-    int count = 0;
-    int status;
-    while ((status = sfs_list(&cookie, lname, sizeof lname)) == 0)
-    {
-        count++;
-        int idx = -1;
-        if (strncmp(lname, "ext", 3) == 0)
-            idx = atoi(lname + 3);
-        CHECK(idx >= 0 && idx < X01_FILES && !seen[idx],
-              "list returned unexpected or duplicate name \"%s\"", lname);
-        if (idx >= 0 && idx < X01_FILES)
-            seen[idx] = 1;
-    }
-    CHECK(status == 1, "list should end with +1, got %d", status);
-    CHECK(count == X01_FILES, "expected %d files in the listing, got %d",
-          X01_FILES, count);
-
-    int fd = sfs_open("ext07");
-    char buf[4] = {0};
-    CHECK(fd >= 0 && sfs_read(fd, buf, 1) == 1 && buf[0] == 'h',
-          "read-back of \"ext07\" failed");
-    sfs_close(fd);
-
-    for (int i = 0; i < X01_FILES; i++)
-    {
-        char name[SFS_FILE_NAME_SIZE_LIMIT];
-        snprintf(name, sizeof name, "ext%02d", i);
-        CHECK(sfs_remove(name) == 0, "remove(\"%s\") failed", name);
-    }
-
-out:
-    unmount_and_check(DISK_NAME);
-    return trace_ok;
-}
-
-/* X02: Unix delete-while-open semantics (see the sfs_remove comment in
-   sfs-disk.c): removing an open file succeeds, the name disappears
-   immediately, and the data stays readable through the open fd until
-   close, at which point the storage is reclaimed.
-
-   Heads up: achieving X02 deliberately conflicts with the graded B02
-   expectation that remove(open file) == -EBUSY.  It is a design
-   exploration, not extra credit; the writeup discusses the trade-off.
-   The starter returns -EBUSY here, which reports X02 as not achieved. */
-static int trace_X02(void)
-{
-    trace_ok = 1;
-    sfs_format(DISK_NAME, disk_size());
-
-    int fd = sfs_open("victim");
-    CHECK(fd >= 0, "open(\"victim\") returned %d", fd);
-    CHECK(sfs_write(fd, "DATA", 4) == 4, "write to \"victim\" failed");
-
-    int r = sfs_remove("victim");
-    CHECK(r == 0,
-          "remove of an open file should succeed with Unix semantics, "
-          "got %d", r);
-    if (r != 0)
-    {
-        sfs_close(fd);
-        goto out;
-    }
-
-    sfs_list_cookie cookie = NULL;
-    char lname[SFS_FILE_NAME_SIZE_LIMIT];
-    int count = 0;
-    while (sfs_list(&cookie, lname, sizeof lname) == 0)
-        count++;
-    CHECK(count == 0, "\"victim\" should leave the directory immediately, "
-          "but %d file(s) are listed", count);
-
-    ssize_t p = sfs_seek(fd, -4);
-    CHECK(p == 0, "seek(-4) on the unlinked fd returned %zd", p);
-    char buf[8] = {0};
-    CHECK(sfs_read(fd, buf, 4) == 4 && memcmp(buf, "DATA", 4) == 0,
-          "unlinked fd should still read its data");
-    CHECK(sfs_write(fd, "MORE", 4) == 4,
-          "unlinked fd should still accept writes");
-
-    int fd2 = sfs_open("victim");
-    CHECK(fd2 >= 0 && fd2 != fd,
-          "re-opening \"victim\" should create a fresh file");
-    if (fd2 >= 0)
-    {
-        CHECK(sfs_read(fd2, buf, 4) == 0,
-              "the fresh \"victim\" should be empty");
-        sfs_close(fd2);
-        CHECK(sfs_remove("victim") == 0, "remove of fresh \"victim\" failed");
-    }
-    sfs_close(fd); /* storage for the unlinked file is reclaimed here */
-
-out:
-    unmount_and_check(DISK_NAME); /* fsck must find no orphaned blocks */
-    return trace_ok;
-}
-
-/* ================================================================== */
-/*  Differential model fuzz (--model-fuzz, diagnostic)                 */
-/* ================================================================== */
-
-/* A seeded random op sequence is applied in lockstep to the student
-   implementation and to a small in-memory reference model; any
-   disagreement in return values, file data, or directory contents is
-   reported together with the seed and the most recent operations, so
-   `./test-sfs --model-fuzz=SEED` replays the failure exactly.
-
-   The model encodes the graded handout contract (including error codes
-   the B traces already rely on: -EBADF, -EBUSY, -ENOENT, -ENOSPC,
-   -EMFILE, -ENAMETOOLONG).  -ENOSYS from the three starter stubs makes
-   the op a no-op on both sides, so the fuzz is useful from the first
-   build onward.  Ops with deliberately unspecified semantics (renaming
-   a file that is open, rename onto itself) are never generated.
-
-   The disk is one page -- the smallest image sfs_format accepts -- so
-   ENOSPC paths get exercised for real on common 4K-page systems. */
-
-#define MF_MAX_FILES 15   /* = DIR_ENTRIES_PER_BLOCK in sfs-disk.h */
-#define MF_MAX_FDS 32     /* = OPEN_FILE_LIMIT in sfs-disk.c */
-#define MF_BLOCK_DATA 500u /* = BLOCK_DATA_SIZE in sfs-disk.h */
-#define MF_FILE_CAP 3500u /* 7 data blocks: a full 4K-page disk */
-#define MF_NAMES 12
-#define MF_DEFAULT_OPS 2000
-#define MF_CHECKPOINT_EVERY 250
-#define MF_LOG_LINES 30
-
-static unsigned int model_fuzz_seed = 1;
-
-struct mf_file
-{
-    int live;
-    char name[SFS_FILE_NAME_SIZE_LIMIT];
-    size_t size;
-};
-
-struct mf_fd
-{
-    int live;
-    int file;
-    size_t pos;
-};
-
-static struct mf_file mf_files[MF_MAX_FILES];
-static char mf_data[MF_MAX_FILES][MF_FILE_CAP];
-static struct mf_fd mf_fds[MF_MAX_FDS];
-static size_t mf_total_blocks;
-static uint64_t mf_rng;
-static int mf_unimpl_calls;
-
-static char mf_log[MF_LOG_LINES][112];
-static int mf_log_next;
-static int mf_log_count;
-
-static uint64_t mf_rand(void)
-{
-    mf_rng ^= mf_rng >> 12;
-    mf_rng ^= mf_rng << 25;
-    mf_rng ^= mf_rng >> 27;
-    return mf_rng * 0x2545F4914F6CDD1Dull;
-}
-
-static unsigned int mf_rand_below(unsigned int n)
-{
-    return (unsigned int)(mf_rand() % n);
-}
-
-static void mf_note(const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(mf_log[mf_log_next], sizeof mf_log[0], fmt, ap);
-    va_end(ap);
-    mf_log_next = (mf_log_next + 1) % MF_LOG_LINES;
-    if (mf_log_count < MF_LOG_LINES)
-        mf_log_count++;
-}
-
-static void mf_dump_log(void)
-{
-    if (quiet_mode)
-        return;
-    FILE *out = check_stream ? check_stream : stderr;
-    fprintf(out, "       -> last %d op(s), oldest first:\n", mf_log_count);
-    int start = (mf_log_next - mf_log_count + MF_LOG_LINES) % MF_LOG_LINES;
-    for (int i = 0; i < mf_log_count; i++)
-        fprintf(out, "          %s\n", mf_log[(start + i) % MF_LOG_LINES]);
-    fflush(out);
-}
-
-static int mf_find(const char *name)
-{
-    for (int i = 0; i < MF_MAX_FILES; i++)
-        if (mf_files[i].live && strcmp(mf_files[i].name, name) == 0)
-            return i;
-    return -1;
-}
-
-static size_t mf_blocks_of(size_t size)
-{
-    return size == 0 ? 1 : (size + MF_BLOCK_DATA - 1) / MF_BLOCK_DATA;
-}
-
-static size_t mf_used_blocks(void)
-{
-    size_t used = 0;
-    for (int i = 0; i < MF_MAX_FILES; i++)
-        if (mf_files[i].live)
-            used += mf_blocks_of(mf_files[i].size);
-    return used;
-}
-
-static int mf_open_fd_count(void)
-{
-    int n = 0;
-    for (int i = 0; i < MF_MAX_FDS; i++)
-        n += mf_fds[i].live;
-    return n;
-}
-
-static int mf_file_has_open_fd(int file)
-{
-    for (int i = 0; i < MF_MAX_FDS; i++)
-        if (mf_fds[i].live && mf_fds[i].file == file)
-            return 1;
-    return 0;
-}
-
-static int mf_create(const char *name)
-{
-    for (int i = 0; i < MF_MAX_FILES; i++)
-    {
-        if (!mf_files[i].live)
-        {
-            mf_files[i].live = 1;
-            mf_files[i].size = 0;
-            snprintf(mf_files[i].name, sizeof mf_files[i].name, "%s", name);
-            memset(mf_data[i], 0, MF_FILE_CAP);
-            return i;
-        }
-    }
-    return -1;
-}
-
-/* Pick a name from the pool; 1 in 16 picks is an over-limit name so the
-   -ENAMETOOLONG paths stay covered. */
-static const char *mf_pick_name(char buf[], size_t cap)
-{
-    unsigned int sel = mf_rand_below(16);
-    if (sel == 15 && cap > SFS_FILE_NAME_SIZE_LIMIT + 4)
-    {
-        memset(buf, 'x', SFS_FILE_NAME_SIZE_LIMIT + 3);
-        buf[SFS_FILE_NAME_SIZE_LIMIT + 3] = '\0';
-        return buf;
-    }
-    snprintf(buf, cap, "f%02u", sel % MF_NAMES);
-    return buf;
-}
-
-/* Mostly a live fd; 1 in 8 picks is deliberately bogus (-1, one past
-   the table, or a random slot that may be dead). */
-static int mf_pick_fd(void)
-{
-    if (mf_rand_below(8) == 0)
-    {
-        unsigned int sel = mf_rand_below(3);
-        if (sel == 0)
-            return -1;
-        if (sel == 1)
-            return MF_MAX_FDS;
-        return (int)mf_rand_below(MF_MAX_FDS);
-    }
-    int live[MF_MAX_FDS];
-    int n = 0;
-    for (int i = 0; i < MF_MAX_FDS; i++)
-        if (mf_fds[i].live)
-            live[n++] = i;
-    if (n == 0)
-        return -1;
-    return live[mf_rand_below((unsigned int)n)];
-}
-
-static int mf_fd_valid(int fd)
-{
-    return fd >= 0 && fd < MF_MAX_FDS && mf_fds[fd].live;
-}
-
-#define MF_FAIL(...)                                                           \
-    do                                                                         \
-    {                                                                          \
-        CHECK(0, __VA_ARGS__);                                                 \
-        mf_dump_log();                                                         \
-        goto mf_done;                                                          \
-    } while (0)
-
-static int trace_model_fuzz(void)
-{
-    trace_ok = 1;
-    memset(mf_files, 0, sizeof mf_files);
-    memset(mf_fds, 0, sizeof mf_fds);
-    mf_log_next = 0;
-    mf_log_count = 0;
-    mf_unimpl_calls = 0;
-    mf_rng = ((uint64_t)model_fuzz_seed + 1) * 0x9E3779B97F4A7C15ull;
-
-    size_t disk_bytes = (size_t)sysconf(_SC_PAGESIZE);
-    mf_total_blocks = disk_bytes / 512u - 1; /* minus the superblock */
-
-    int r = sfs_format(MODEL_DISK, disk_bytes);
-    CHECK(r == 0, "sfs_format(%zu) returned %d", disk_bytes, r);
-    if (r != 0)
-        return trace_ok;
-
-    char namebuf[SFS_FILE_NAME_SIZE_LIMIT + 8];
-    char namebuf2[SFS_FILE_NAME_SIZE_LIMIT + 8];
-    char iobuf[2048];
-    char payload[2048];
-
-    for (int op = 1; op <= MF_DEFAULT_OPS; op++)
-    {
-        unsigned int kind = mf_rand_below(24);
-
-        if (kind < 4)
-        {
-            /* open */
-            const char *name = mf_pick_name(namebuf, sizeof namebuf);
-            r = sfs_open(name);
-            mf_note("%4d: open(\"%s\") = %d", op, name, r);
-            if (strnlen(name, SFS_FILE_NAME_SIZE_LIMIT + 1) + 1 >
-                SFS_FILE_NAME_SIZE_LIMIT)
-            {
-                if (r != -ENAMETOOLONG)
-                    MF_FAIL("op %d: open(<%zu-char name>) should be "
-                            "-ENAMETOOLONG, got %d",
-                            op, strlen(name), r);
-                continue;
-            }
-            int fi = mf_find(name);
-            int fds_full = mf_open_fd_count() >= MF_MAX_FDS;
-            if (fi < 0)
-            {
-                if (mf_used_blocks() + 1 > mf_total_blocks)
-                {
-                    if (r != -ENOSPC)
-                        MF_FAIL("op %d: open(\"%s\") creating on a full disk "
-                                "should be -ENOSPC, got %d", op, name, r);
-                    continue;
-                }
-                if (fds_full)
-                {
-                    /* Handout behavior: the directory entry is created
-                       before fd allocation fails, so the file exists
-                       even though open() reports -EMFILE. */
-                    if (r != -EMFILE)
-                        MF_FAIL("op %d: open(\"%s\") with all %d fds in use "
-                                "should be -EMFILE, got %d",
-                                op, name, MF_MAX_FDS, r);
-                    if (mf_create(name) < 0)
-                        MF_FAIL("op %d: model bug: no free directory slot",
-                                op);
-                    continue;
-                }
-                if (r < 0)
-                    MF_FAIL("op %d: open(\"%s\") should create the file, "
-                            "got %d", op, name, r);
-                fi = mf_create(name);
-                if (fi < 0)
-                    MF_FAIL("op %d: model bug: no free directory slot", op);
-            }
-            else
-            {
-                if (fds_full)
-                {
-                    if (r != -EMFILE)
-                        MF_FAIL("op %d: open(\"%s\") with all %d fds in use "
-                                "should be -EMFILE, got %d",
-                                op, name, MF_MAX_FDS, r);
-                    continue;
-                }
-                if (r < 0)
-                    MF_FAIL("op %d: open(\"%s\") of an existing file failed "
-                            "with %d", op, name, r);
-            }
-            if (r >= MF_MAX_FDS)
-                MF_FAIL("op %d: open returned out-of-range fd %d", op, r);
-            if (mf_fds[r].live)
-                MF_FAIL("op %d: open returned fd %d, which is already open",
-                        op, r);
-            mf_fds[r].live = 1;
-            mf_fds[r].file = fi;
-            mf_fds[r].pos = 0;
-        }
-        else if (kind < 8)
-        {
-            /* close */
-            int fd = mf_pick_fd();
-            sfs_close(fd);
-            mf_note("%4d: close(%d)", op, fd);
-            if (mf_fd_valid(fd))
-                mf_fds[fd].live = 0;
-        }
-        else if (kind < 12)
-        {
-            /* read */
-            int fd = mf_pick_fd();
-            unsigned int lensel = mf_rand_below(4);
-            size_t len = lensel == 0 ? 0
-                         : lensel == 1 ? 1 + mf_rand_below(64)
-                         : lensel == 2 ? 400 + mf_rand_below(220)
-                                       : 1000 + mf_rand_below(1048);
-            ssize_t nr = sfs_read(fd, iobuf, len);
-            mf_note("%4d: read(%d, len=%zu) = %zd", op, fd, len, nr);
-            if (!mf_fd_valid(fd))
-            {
-                if (nr != -EBADF)
-                    MF_FAIL("op %d: read(bad fd %d) should be -EBADF, got %zd",
-                            op, fd, nr);
-                continue;
-            }
-            struct mf_fd *m = &mf_fds[fd];
-            struct mf_file *f = &mf_files[m->file];
-            size_t want = f->size - m->pos;
-            if (len < want)
-                want = len;
-            if (nr != (ssize_t)want)
-                MF_FAIL("op %d: read(fd %d, len=%zu) at pos %zu of %zu-byte "
-                        "file should return %zu, got %zd",
-                        op, fd, len, m->pos, f->size, want, nr);
-            if (want > 0 && memcmp(iobuf, mf_data[m->file] + m->pos, want))
-                MF_FAIL("op %d: read(fd %d) data mismatch at pos %zu "
-                        "(%zu bytes)", op, fd, m->pos, want);
-            m->pos += want;
-        }
-        else if (kind < 16)
-        {
-            /* write */
-            int fd = mf_pick_fd();
-            unsigned int lensel = mf_rand_below(4);
-            size_t len = lensel == 0 ? 0
-                         : lensel == 1 ? 1 + mf_rand_below(64)
-                         : lensel == 2 ? 400 + mf_rand_below(220)
-                                       : 1000 + mf_rand_below(1048);
-            if (mf_fd_valid(fd))
-            {
-                /* Keep files within the model's per-file buffer; the cap
-                   equals a full 4K-page disk so nothing is lost. */
-                size_t room = MF_FILE_CAP - mf_fds[fd].pos;
-                if (len > room)
-                    len = room;
-            }
-            for (size_t i = 0; i < len; i++)
-                payload[i] = (char)('a' + (((size_t)op + i) % 26u));
-            ssize_t nw = sfs_write(fd, payload, len);
-            mf_note("%4d: write(%d, len=%zu) = %zd", op, fd, len, nw);
-            if (!mf_fd_valid(fd))
-            {
-                if (nw != -EBADF)
-                    MF_FAIL("op %d: write(bad fd %d) should be -EBADF, "
-                            "got %zd", op, fd, nw);
-                continue;
-            }
-            struct mf_fd *m = &mf_fds[fd];
-            struct mf_file *f = &mf_files[m->file];
-            size_t endPos = m->pos + len;
-            size_t have = mf_blocks_of(f->size);
-            size_t need = mf_blocks_of(endPos == 0 ? f->size : endPos);
-            size_t addl = need > have ? need - have : 0;
-            if (addl > 0 &&
-                mf_used_blocks() + addl > mf_total_blocks)
-            {
-                if (nw != -ENOSPC)
-                    MF_FAIL("op %d: write(fd %d, len=%zu) needing %zu new "
-                            "block(s) on a full disk should be -ENOSPC, "
-                            "got %zd", op, fd, len, addl, nw);
-                continue;
-            }
-            if (nw != (ssize_t)len)
-                MF_FAIL("op %d: write(fd %d, len=%zu) should write all "
-                        "bytes, got %zd", op, fd, len, nw);
-            if (len > 0)
-            {
-                memcpy(mf_data[m->file] + m->pos, payload, len);
-                m->pos = endPos;
-                if (endPos > f->size)
-                    f->size = endPos;
-            }
-        }
-        else if (kind < 18)
-        {
-            /* seek */
-            int fd = mf_pick_fd();
-            ssize_t delta;
-            unsigned int dsel = mf_rand_below(8);
-            if (dsel == 0)
-                delta = 9999;
-            else if (dsel == 1)
-                delta = -9999;
-            else
-                delta = (ssize_t)mf_rand_below(3201) - 1600;
-            ssize_t p = sfs_seek(fd, delta);
-            mf_note("%4d: seek(%d, %zd) = %zd", op, fd, delta, p);
-            if (p == -ENOSYS)
-            {
-                mf_unimpl_calls++;
-                continue;
-            }
-            if (!mf_fd_valid(fd))
-            {
-                if (p != -EBADF)
-                    MF_FAIL("op %d: seek(bad fd %d) should be -EBADF, "
-                            "got %zd", op, fd, p);
-                continue;
-            }
-            struct mf_fd *m = &mf_fds[fd];
-            struct mf_file *f = &mf_files[m->file];
-            ssize_t want = (ssize_t)m->pos + delta;
-            if (want < 0)
-                want = 0;
-            if ((size_t)want > f->size)
-                want = (ssize_t)f->size;
-            if (p != want)
-                MF_FAIL("op %d: seek(fd %d, %zd) from pos %zu of %zu-byte "
-                        "file should return %zd, got %zd",
-                        op, fd, delta, m->pos, f->size, want, p);
-            m->pos = (size_t)want;
-        }
-        else if (kind < 20)
-        {
-            /* getpos */
-            int fd = mf_pick_fd();
-            ssize_t p = sfs_getpos(fd);
-            mf_note("%4d: getpos(%d) = %zd", op, fd, p);
-            if (p == -ENOSYS)
-            {
-                mf_unimpl_calls++;
-                continue;
-            }
-            if (!mf_fd_valid(fd))
-            {
-                if (p != -EBADF)
-                    MF_FAIL("op %d: getpos(bad fd %d) should be -EBADF, "
-                            "got %zd", op, fd, p);
-                continue;
-            }
-            if (p != (ssize_t)mf_fds[fd].pos)
-                MF_FAIL("op %d: getpos(fd %d) should be %zu, got %zd",
-                        op, fd, mf_fds[fd].pos, p);
-        }
-        else if (kind < 21)
-        {
-            /* remove */
-            const char *name = mf_pick_name(namebuf, sizeof namebuf);
-            r = sfs_remove(name);
-            mf_note("%4d: remove(\"%s\") = %d", op, name, r);
-            if (strnlen(name, SFS_FILE_NAME_SIZE_LIMIT + 1) + 1 >
-                SFS_FILE_NAME_SIZE_LIMIT)
-            {
-                if (r != -ENAMETOOLONG)
-                    MF_FAIL("op %d: remove(<long name>) should be "
-                            "-ENAMETOOLONG, got %d", op, r);
-                continue;
-            }
-            int fi = mf_find(name);
-            if (fi < 0)
-            {
-                if (r != -ENOENT)
-                    MF_FAIL("op %d: remove(\"%s\") of a missing file should "
-                            "be -ENOENT, got %d", op, name, r);
-                continue;
-            }
-            if (mf_file_has_open_fd(fi))
-            {
-                if (r != -EBUSY)
-                    MF_FAIL("op %d: remove(\"%s\") of an open file should be "
-                            "-EBUSY, got %d", op, name, r);
-                continue;
-            }
-            if (r != 0)
-                MF_FAIL("op %d: remove(\"%s\") should succeed, got %d",
-                        op, name, r);
-            mf_files[fi].live = 0;
-        }
-        else if (kind < 22)
-        {
-            /* rename; skip generations with unspecified semantics */
-            const char *old_name = mf_pick_name(namebuf, sizeof namebuf);
-            const char *new_name = mf_pick_name(namebuf2, sizeof namebuf2);
-            int old_long = strnlen(old_name, SFS_FILE_NAME_SIZE_LIMIT + 1) +
-                               1 > SFS_FILE_NAME_SIZE_LIMIT;
-            int new_long = strnlen(new_name, SFS_FILE_NAME_SIZE_LIMIT + 1) +
-                               1 > SFS_FILE_NAME_SIZE_LIMIT;
-            if (!old_long && !new_long)
-            {
-                if (strcmp(old_name, new_name) == 0)
-                    continue;
-                int oi = mf_find(old_name);
-                int ni = mf_find(new_name);
-                if ((oi >= 0 && mf_file_has_open_fd(oi)) ||
-                    (ni >= 0 && mf_file_has_open_fd(ni)))
-                    continue;
-            }
-            r = sfs_rename(old_name, new_name);
-            mf_note("%4d: rename(\"%.10s\", \"%.10s\") = %d",
-                    op, old_name, new_name, r);
-            if (r == -ENOSYS)
-            {
-                mf_unimpl_calls++;
-                continue;
-            }
-            if (old_long || new_long)
-            {
-                if (r != -ENAMETOOLONG)
-                    MF_FAIL("op %d: rename with an over-limit name should be "
-                            "-ENAMETOOLONG, got %d", op, r);
-                continue;
-            }
-            int oi = mf_find(old_name);
-            int ni = mf_find(new_name);
-            if (oi < 0)
-            {
-                if (r != -ENOENT)
-                    MF_FAIL("op %d: rename(\"%s\", ...) of a missing file "
-                            "should be -ENOENT, got %d", op, old_name, r);
-                continue;
-            }
-            if (r != 0)
-                MF_FAIL("op %d: rename(\"%s\", \"%s\") should succeed, "
-                        "got %d", op, old_name, new_name, r);
-            if (ni >= 0)
-                mf_files[ni].live = 0;
-            snprintf(mf_files[oi].name, sizeof mf_files[oi].name, "%s",
-                     new_name);
-        }
-        else if (kind < 23)
-        {
-            /* full directory listing */
-            sfs_list_cookie cookie = NULL;
-            char seen[MF_MAX_FILES] = {0};
-            char lname[SFS_FILE_NAME_SIZE_LIMIT];
-            int status;
-            int count = 0;
-            while ((status = sfs_list(&cookie, lname, sizeof lname)) == 0)
-            {
-                count++;
-                if (count > MF_MAX_FILES)
-                    break;
-                int fi = mf_find(lname);
-                if (fi < 0)
-                    MF_FAIL("op %d: list returned \"%s\", which should not "
-                            "exist", op, lname);
-                if (seen[fi])
-                    MF_FAIL("op %d: list returned \"%s\" twice", op, lname);
-                seen[fi] = 1;
-            }
-            mf_note("%4d: list -> %d file(s), status %d", op, count, status);
-            if (status != 1)
-                MF_FAIL("op %d: list should end with +1, got %d", op, status);
-            int live = 0;
-            for (int i = 0; i < MF_MAX_FILES; i++)
-                live += mf_files[i].live;
-            if (count != live)
-                MF_FAIL("op %d: list found %d file(s), model has %d",
-                        op, count, live);
-        }
-        else
-        {
-            /* explicit bad-fd probes */
-            int fd = mf_rand_below(2) ? -1 : MF_MAX_FDS;
-            ssize_t nr = sfs_read(fd, iobuf, 8);
-            ssize_t nw = sfs_write(fd, "x", 1);
-            mf_note("%4d: badfd(%d) read=%zd write=%zd", op, fd, nr, nw);
-            if (nr != -EBADF || nw != -EBADF)
-                MF_FAIL("op %d: read/write on fd %d should be -EBADF, "
-                        "got %zd/%zd", op, fd, nr, nw);
-            sfs_close(fd);
-        }
-
-        if (op % MF_CHECKPOINT_EVERY == 0 || op == MF_DEFAULT_OPS)
-        {
-            /* checkpoint: close everything, unmount, fsck, remount */
-            for (int i = 0; i < MF_MAX_FDS; i++)
-            {
-                if (mf_fds[i].live)
-                {
-                    sfs_close(i);
-                    mf_fds[i].live = 0;
-                }
-            }
-            r = sfs_unmount();
-            mf_note("%4d: checkpoint unmount = %d", op, r);
-            if (r != 0)
-                MF_FAIL("op %d: checkpoint unmount should succeed, got %d",
-                        op, r);
-            char detail[384];
-            int rc = run_fsck_capture(MODEL_DISK, detail, sizeof detail);
-            if (rc != 0)
-                MF_FAIL("op %d: checkpoint sfs-fsck failed (exit %d): %s",
-                        op, rc, detail[0] ? detail : "no output");
-            r = sfs_mount(MODEL_DISK);
-            if (r != 0)
-                MF_FAIL("op %d: checkpoint remount failed: %d", op, r);
-        }
-    }
-
-mf_done:
-    for (int i = 0; i < MF_MAX_FDS; i++)
-        sfs_close(i);
-    sfs_unmount();
-    if (trace_ok)
-    {
-        unlink(MODEL_DISK);
-        if (mf_unimpl_calls > 0)
-            printf("  (model fuzz: %d call(s) hit -ENOSYS stubs and were "
-                   "treated as no-ops)\n", mf_unimpl_calls);
-    }
-    return trace_ok;
-}
-
-#undef MF_FAIL
 
 /* ================================================================== */
 /*  Performance Benchmark                                              */
@@ -2387,30 +1461,6 @@ static double elapsed_sec(struct timespec *start, struct timespec *end)
            (double)(end->tv_nsec - start->tv_nsec) / 1e9;
 }
 
-/* Build the preferred path to .perf_baseline: next to the currently running
-   executable (via /proc/self/exe), so `./test-sfs` still finds the file when
-   invoked from a different cwd. Writes at most `cap` bytes into `out` and
-   returns 0 on success, -1 if the path did not fit. Callers should try a
-   plain "./.perf_baseline" fallback if the exe-relative file does not exist. */
-static int resolve_baseline_path(char *out, size_t cap)
-{
-    char exe[PATH_MAX];
-    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-    if (n > 0 && (size_t)n < sizeof(exe))
-    {
-        exe[n] = '\0';
-        char *slash = strrchr(exe, '/');
-        if (slash)
-        {
-            *slash = '\0';
-            int k = snprintf(out, cap, "%s/.perf_baseline", exe);
-            if (k > 0 && (size_t)k < cap) return 0;
-        }
-    }
-    int k = snprintf(out, cap, ".perf_baseline");
-    return (k > 0 && (size_t)k < cap) ? 0 : -1;
-}
-
 struct baseline_info
 {
     double ops;
@@ -2420,28 +1470,21 @@ struct baseline_info
     char   workload[32];           /* WORKLOAD= tag; "v1" for pre-tag files */
 };
 
-/* Populate `info` from .perf_baseline. Tries the exe-relative path first,
-   then falls back to "./.perf_baseline". Returns 0 on success, -1 if the
-   file is missing, unreadable, or holds a non-finite / non-positive value. */
+/* Populate `info` from ./.perf_baseline.  Like the rest of the driver
+   (sfs-fsck invocation, TSan self-compile), this expects to run from the
+   handout directory.  Returns 0 on success, -1 if the file is missing,
+   unreadable, or holds a non-finite / non-positive value. */
 static int load_baseline(struct baseline_info *info)
 {
     info->ops = -1.0;
     info->mtime = 0;
-    info->path[0] = '\0';
+    snprintf(info->path, sizeof(info->path), ".perf_baseline");
     snprintf(info->disk_dir, sizeof(info->disk_dir), "(unset)");
     /* Files written before the workload tag existed are all from the
        original (v1) benchmark shape. */
     snprintf(info->workload, sizeof(info->workload), "v1");
 
-    if (resolve_baseline_path(info->path, sizeof(info->path)) != 0)
-        return -1;
-
     FILE *f = fopen(info->path, "r");
-    if (!f && strcmp(info->path, ".perf_baseline") != 0)
-    {
-        snprintf(info->path, sizeof(info->path), ".perf_baseline");
-        f = fopen(info->path, "r");
-    }
     if (!f) return -1;
 
     /* .perf_baseline format:
@@ -2641,7 +1684,7 @@ static int run_perf_benchmark(void)
            PERF_SAMPLE_RUNS, median, total_calls, spread);
     if (spread > 20.0)
         printf("  Warning: spread exceeds 20%% -- perf ratio will be noisy;\n"
-               "           see writeup section 5.4 (Docker/Windows) for mitigation.\n");
+               "           see the writeup's Docker/WSL notes for mitigation.\n");
     return score_perf_against_baseline(median);
 }
 
@@ -2685,8 +1728,7 @@ static enum tsan_result run_tsan_check(void)
     char compile_cmd[512];
     snprintf(compile_cmd, sizeof compile_cmd,
              "gcc -std=c11 -g -fsanitize=thread -pthread -D_GNU_SOURCE=1 "
-             "-I. -o %s local/test-sfs.c local/test-report.c "
-             "sfs-disk.c sfs-support.c 2>&1",
+             "-I. -o %s test-sfs.c sfs-disk.c sfs-support.c 2>&1",
              tsan_bin);
 
     int rc = system(compile_cmd);
@@ -2737,8 +1779,8 @@ static enum tsan_result run_tsan_check(void)
         {
             printf("  DATA RACE DETECTED (schedule-fuzz seed %u) -- "
                    "Category C score set to 0\n", seed);
-            printf("  Race stacks were suppressed; SFS_Lab_Writeup.md shows "
-                   "how to rerun TSan to print them.\n");
+            printf("  Race stacks were suppressed; see the lab writeup for "
+                   "how to rerun TSan and print them.\n");
             result = TSAN_RACE;
             break;
         }
@@ -2963,88 +2005,24 @@ static int run_trace_with_timeout(const char *id, trace_fn fn,
     return 0;
 }
 
-/* Run the X traces, each forked with a timeout.  In the default full
-   run they execute quietly and show "--" when not achieved, so an
-   untouched starter is not flooded with FAIL detail for optional work;
-   --x-only prints the full diagnostics. */
-static int run_x_traces(int show_detail)
-{
-    struct trace_entry xs[] = {
-        {"X00", "empty_file_blocks", trace_X00},
-        {"X01", "dir_expansion", trace_X01},
-        {"X02", "unix_remove", trace_X02},
-    };
-    const int n = (int)(sizeof xs / sizeof xs[0]);
-
-    printf("\nCategory X (Optional Challenges, not scored):\n");
-    int achieved = 0;
-    for (int i = 0; i < n; i++)
-    {
-        int saved_quiet = quiet_mode;
-        if (!show_detail)
-            quiet_mode = 1;
-        atomic_store_explicit(&trace_fail_count, 0, memory_order_relaxed);
-        char *buf = NULL;
-        size_t buflen = 0;
-        int ok = run_trace_with_timeout(xs[i].id, xs[i].fn, &buf, &buflen);
-        quiet_mode = saved_quiet;
-        achieved += ok;
-        printf("  %s %-24s %s  [optional]\n", xs[i].id, xs[i].name,
-               ok ? "PASS" : "--");
-        fflush(stdout);
-        if (show_detail && buf && buflen > 0)
-            fwrite(buf, 1, buflen, stderr);
-        fflush(stderr);
-        free(buf);
-    }
-    printf("  Achieved: %d/%d (does not affect the graded score)\n",
-           achieved, n);
-    return achieved;
-}
-
 static int run_category(const char *label, struct trace_entry *traces, int n)
 {
     printf("\nCategory %s:\n", label);
-    /* Concurrent and stress diagnostics run in a forked child so deadlocks,
-       aborts, and heap corruption in the student's implementation do not take
-       down the autograder/reporting process. */
-    int use_timeout = (label[0] == 'C' || strncmp(label, "Stress", 6) == 0 ||
-                       strncmp(label, "Model", 5) == 0);
     int passed = 0;
     for (int i = 0; i < n; i++)
     {
-        int ok;
         char *buf = NULL;
         size_t buflen = 0;
-        FILE *ms = NULL;
 
         atomic_store_explicit(&trace_fail_count, 0, memory_order_relaxed);
-        if (use_timeout)
-        {
-            /* Forked child's stderr is captured via pipe; the returned buf
-               holds FAIL details (and TIMEOUT/CRASH if any) for the parent
-               to print after the summary line, same ordering as A/B. */
-            ok = run_trace_with_timeout(traces[i].id, traces[i].fn,
+        /* Every trace runs in a forked child with a timeout, so a deadlock,
+           crash, or assertion failure in the student's implementation fails
+           that one trace instead of taking down the autograder.  The child's
+           stderr is captured via a pipe; the returned buf holds FAIL details
+           (and TIMEOUT/CRASH if any) for the parent to print after the
+           summary line. */
+        int ok = run_trace_with_timeout(traces[i].id, traces[i].fn,
                                         &buf, &buflen);
-        }
-        else
-        {
-            ms = open_memstream(&buf, &buflen);
-            check_stream = ms ? ms : stderr;
-            ok = traces[i].fn();
-            trace_fail_tail(check_stream);
-            if (!ok)
-            {
-                char *hint = keep_failure_images(traces[i].id);
-                if (hint)
-                {
-                    fputs(hint, check_stream);
-                    free(hint);
-                }
-            }
-            check_stream = stderr;
-            if (ms) fclose(ms);
-        }
         passed += ok;
         printf("  %s %-24s %s  [%d/1]\n", traces[i].id, traces[i].name,
                ok ? "PASS" : "FAIL", ok);
@@ -3057,55 +2035,12 @@ static int run_category(const char *label, struct trace_entry *traces, int n)
     return passed;
 }
 
-static int silence_stdout(int *saved_stdout)
-{
-    fflush(stdout);
-    *saved_stdout = dup(STDOUT_FILENO);
-    if (*saved_stdout < 0)
-        return -1;
-
-    int devnull = open("/dev/null", O_WRONLY);
-    if (devnull < 0)
-    {
-        close(*saved_stdout);
-        *saved_stdout = -1;
-        return -1;
-    }
-
-    if (dup2(devnull, STDOUT_FILENO) < 0)
-    {
-        close(devnull);
-        close(*saved_stdout);
-        *saved_stdout = -1;
-        return -1;
-    }
-    close(devnull);
-    return 0;
-}
-
-static void restore_stdout(int saved_stdout)
-{
-    fflush(stdout);
-    if (saved_stdout >= 0)
-    {
-        dup2(saved_stdout, STDOUT_FILENO);
-        close(saved_stdout);
-    }
-}
-
 int main(int argc, char *argv[])
 {
     init_disk_paths();
 
     int mode_tsan_only = 0;
     int mode_perf_only = 0;
-    int mode_smoke_only = 0;
-    int mode_concurrency_only = 0;
-    int mode_stress_only = 0;
-    int mode_model_fuzz = 0;
-    int mode_x_only = 0;
-    int mode_list_traces = 0;
-    int mode_json = 0;
     for (int i = 1; i < argc; i++)
     {
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0)
@@ -3116,30 +2051,10 @@ int main(int argc, char *argv[])
             mode_tsan_only = 1;
         else if (strcmp(argv[i], "--perf-only") == 0)
             mode_perf_only = 1;
-        else if (strcmp(argv[i], "--smoke-only") == 0)
-            mode_smoke_only = 1;
-        else if (strcmp(argv[i], "--concurrency-only") == 0)
-            mode_concurrency_only = 1;
-        else if (strcmp(argv[i], "--stress-only") == 0)
-            mode_stress_only = 1;
-        else if (strcmp(argv[i], "--list-traces") == 0)
-            mode_list_traces = 1;
-        else if (strcmp(argv[i], "--json") == 0)
-            mode_json = 1;
         else if (strcmp(argv[i], "--sched-fuzz") == 0)
             sched_fuzz_seed = 1;
         else if (strncmp(argv[i], "--sched-fuzz=", 13) == 0)
             sched_fuzz_seed = (unsigned int)strtoul(argv[i] + 13, NULL, 10);
-        else if (strcmp(argv[i], "--x-only") == 0)
-            mode_x_only = 1;
-        else if (strcmp(argv[i], "--model-fuzz") == 0)
-            mode_model_fuzz = 1;
-        else if (strncmp(argv[i], "--model-fuzz=", 13) == 0)
-        {
-            mode_model_fuzz = 1;
-            model_fuzz_seed =
-                (unsigned int)strtoul(argv[i] + 13, NULL, 10);
-        }
         else
             fprintf(stderr, "warning: unknown argument '%s' (ignored)\n", argv[i]);
     }
@@ -3153,7 +2068,7 @@ int main(int argc, char *argv[])
     if (sched_fuzz_seed != 0)
         fprintf(stderr, "Schedule fuzz active (seed %u)\n", sched_fuzz_seed);
 
-    keep_failed_disks = !mode_json && !mode_tsan_only;
+    keep_failed_disks = !mode_tsan_only;
     const char *kfd = getenv("SFS_KEEP_FAILED_DISKS");
     if (kfd && *kfd)
         keep_failed_disks = strcmp(kfd, "0") != 0;
@@ -3165,7 +2080,7 @@ int main(int argc, char *argv[])
         struct trace_entry cat_c[] = {
             {"C00", "separate_files", trace_C00},
             {"C01", "read_same_file", trace_C01},
-            {"C02", "rw_mix_storm", trace_C02},
+            {"C02", "rw_mix_storm_churn", trace_C02},
         };
         quiet_mode = 1;
         serialize_c_api_calls = 0;
@@ -3203,108 +2118,12 @@ int main(int argc, char *argv[])
     struct trace_entry cat_c[] = {
         {"C00", "separate_files", trace_C00},
         {"C01", "read_same_file", trace_C01},
-        {"C02", "rw_mix_storm", trace_C02},
+        {"C02", "rw_mix_storm_churn", trace_C02},
     };
-
-    struct trace_entry stress_traces[] = {
-        {"S00", "dir_churn", trace_stress_dir_churn},
-        {"S01", "rename_atomic", trace_stress_rename_atomic},
-    };
-    const int n_stress = (int)(sizeof stress_traces / sizeof stress_traces[0]);
-
-    if (mode_list_traces)
-    {
-        printf("category\tid\tname\tpoints\n");
-        for (int i = 0; i < 5; i++)
-            printf("A\t%s\t%s\t1\n", cat_a[i].id, cat_a[i].name);
-        for (int i = 0; i < 4; i++)
-            printf("B\t%s\t%s\t1\n", cat_b[i].id, cat_b[i].name);
-        for (int i = 0; i < 3; i++)
-            printf("C\t%s\t%s\t1\n", cat_c[i].id, cat_c[i].name);
-        printf("Perf\tbenchmark\tthroughput\t10\n");
-        return 0;
-    }
-
-    int saved_stdout = -1;
-    if (mode_json)
-    {
-        quiet_mode = 1;
-        if (silence_stdout(&saved_stdout) != 0)
-        {
-            fprintf(stderr, "warning: could not silence stdout for JSON mode\n");
-            saved_stdout = -1;
-        }
-    }
 
     printf("========================================\n");
     printf("        SFS Lab Autograder\n");
     printf("========================================\n");
-
-    if (mode_smoke_only)
-    {
-        int smoke = run_category("Smoke", cat_a, 2);
-        unlink(DISK_NAME);
-        return (smoke == 2) ? 0 : 1;
-    }
-
-    if (mode_concurrency_only)
-    {
-        int c = run_category("C (Concurrent Correctness)", cat_c, 3);
-        unlink(DISK_NAME);
-        cleanup_concurrency_disks();
-        if (mode_json)
-        {
-            restore_stdout(saved_stdout);
-            test_report_print_trace_set_json("concurrency", c, 3, 1);
-        }
-        return (c == 3) ? 0 : 1;
-    }
-
-    if (mode_x_only)
-    {
-        int x = run_x_traces(1);
-        unlink(DISK_NAME);
-        if (mode_json)
-        {
-            restore_stdout(saved_stdout);
-            test_report_print_trace_set_json("x_traces", x, 3, 0);
-        }
-        return (x == 3) ? 0 : 1;
-    }
-
-    if (mode_model_fuzz)
-    {
-        printf("  (differential model fuzz, seed %u, %d ops; rerun with "
-               "--model-fuzz=%u)\n",
-               model_fuzz_seed, MF_DEFAULT_OPS, model_fuzz_seed);
-        struct trace_entry mf_traces[] = {
-            {"M00", "model_fuzz", trace_model_fuzz},
-        };
-        int mf_ok = run_category("Model Fuzz (differential, diagnostic)",
-                                 mf_traces, 1);
-        unlink(MODEL_DISK);
-        if (mode_json)
-        {
-            restore_stdout(saved_stdout);
-            test_report_print_trace_set_json("model_fuzz", mf_ok, 1, 0);
-        }
-        return (mf_ok == 1) ? 0 : 1;
-    }
-
-    if (mode_stress_only)
-    {
-        int stress = run_category("Stress Diagnostics", stress_traces,
-                                  n_stress);
-        unlink(DISK_NAME);
-        cleanup_concurrency_disks();
-        if (mode_json)
-        {
-            restore_stdout(saved_stdout);
-            test_report_print_trace_set_json("stress_diagnostics", stress,
-                                             n_stress, 0);
-        }
-        return (stress == n_stress) ? 0 : 1;
-    }
 
     int a = run_category("A (Feature Tests)", cat_a, 5);
     int b = run_category("B (Sequential Correctness)", cat_b, 4);
@@ -3330,7 +2149,6 @@ int main(int argc, char *argv[])
 
     printf("\nPerformance:\n");
     int perf = 0;
-    int perf_ran = 0;
     if (correctness < 12)
     {
         printf("  (skipped -- correctness tests must all pass first)\n");
@@ -3338,7 +2156,6 @@ int main(int argc, char *argv[])
     }
     else
     {
-        perf_ran = 1;
         /* Perf benchmark also needs deadlock protection -- 60s budget
            (longer than a Category C trace because slower machines may
            legitimately take more time on the full workload). */
@@ -3406,15 +2223,6 @@ int main(int argc, char *argv[])
     printf("  Total: %d/22  (+ up to 4 style pts)\n", total);
     printf("========================================\n");
 
-    /* Optional challenges run after the graded scoreboard; they never
-       change the score or the exit status. */
-    int x = run_x_traces(0);
-
     unlink(DISK_NAME);
-    if (mode_json)
-    {
-        restore_stdout(saved_stdout);
-        test_report_print_score_json(a, b, c, tsan, perf, perf_ran, x);
-    }
     return (correctness == 12) ? 0 : 1;
 }

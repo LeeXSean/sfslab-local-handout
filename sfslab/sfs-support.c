@@ -234,10 +234,15 @@ int sfs_unmount(void)
     if (sfs_has_open_files())
         return -EBUSY;
 
-    size_t diskSize = accessSuperBlock()->n_blocks * SFS_BLOCK_SIZE;
+    // The munmap length must be the size we actually mapped.  The
+    // superblock's n_blocks field is on-disk data that is not
+    // guaranteed to match the mapping, and multiplying it by
+    // SFS_BLOCK_SIZE happens in 32-bit arithmetic, which overflows
+    // for images of 4 GiB and larger.
+    //
     // munmap could conceivably report an I/O error.  If it does,
     // the file has been unmapped anyway (same principle as close().)
-    int status = munmap(diskBlocks, diskSize);
+    int status = munmap(diskBlocks, diskSizeInBytes);
     diskBlocks = NULL;
     diskSizeInBytes = 0;
     

@@ -587,13 +587,23 @@ int sfs_rename(const char *old_name, const char *new_name)
 int sfs_list(sfs_list_cookie *cookie, char filename_out[],
              size_t filename_space)
 {
+    // The API promises that whenever this function returns a nonzero
+    // status -- errors included -- the cookie is reset to NULL, so a
+    // caller can always start a fresh loop afterward.
+
     // Corner case: If filename_space is zero, we cannot produce
     // an empty string into it on error.
     if (filename_space == 0)
+    {
+        *cookie = NULL;
         return -EINVAL;
+    }
 
     if (getSFSStatus() < 0)
+    {
+        *cookie = NULL;
         return -ENOMEDIUM;
+    }
 
     // The cookie value is just an offset within the localFiles array,
     // cast to void*.  It could be necessary to change this in order
@@ -612,6 +622,7 @@ int sfs_list(sfs_list_cookie *cookie, char filename_out[],
             size_t len = strlen(e->name);
             if (len + 1 > filename_space)
             {
+                *cookie = NULL;
                 return -ENAMETOOLONG;
             }
             memcpy(filename_out, e->name, len + 1);

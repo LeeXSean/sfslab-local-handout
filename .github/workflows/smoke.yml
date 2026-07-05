@@ -10,57 +10,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install trace tools
+      - name: Build
+        run: make -C sfslab all
+
+      - name: Run autograder on starter (expected incomplete, exit 1)
+        run: |
+          cd sfslab
+          ./test-sfs -q && exit 1 || test $? -eq 1
+
+      - name: Rebuild handout tarball and compare to committed copy
+        run: |
+          make dist
+          git diff --exit-code -- sfslab-handout.tar
+
+      - name: Build writeup PDF
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-format liblua5.4-dev lua5.4 pkg-config shellcheck
-
-      - name: Check environment
-        run: make doctor
-
-      - name: Run lint
-        run: make lint-strict
-
-      - name: Run development check
-        run: make check
-
-      - name: Check after score artifacts
-        run: |
-          make json > /tmp/sfslab-score.json || true
-          python3 -m json.tool /tmp/sfslab-score.json > /dev/null
-          make check
-
-      - name: Run Lua trace smoke
-        run: make trace-smoke
-
-      - name: Check JSON report
-        run: |
-          make report-json > /tmp/sfslab-report.json
-          python3 -m json.tool /tmp/sfslab-report.json > /dev/null
-          python3 docs/examples/compare-starter-report.py docs/examples/starter-report.json /tmp/sfslab-report.json
-
-      - name: Test report comparison helper
-        run: python3 docs/examples/test_compare_starter_report.py
-
-      - name: Build and verify dist tarball
-        run: make dist-verify
-
-      - name: Check dist reproducibility
-        run: make dist-repro-check
-
-      - name: Check release artifact and worktree cleanliness
-        run: |
-          git diff --exit-code -- sfslab-handout.tar
-          status="$(git status --porcelain=v1 --untracked-files=all)"
-          if [ -n "$status" ]; then
-            printf '%s\n' "$status"
-            exit 1
-          fi
-
-  docker-fallback:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run Docker fallback trace smoke
-        run: make docker-trace-smoke
+          sudo apt-get install -y --no-install-recommends groff-base ghostscript
+          make pdf

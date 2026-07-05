@@ -98,7 +98,7 @@ static void fput_escaped_n(const unsigned char *s, size_t n, FILE *fp)
         }
         else if (c == '\t')
         {
-            fputs("\\n", fp);
+            fputs("\\t", fp);
         }
         else if (c >= ' ' && c <= '~')
         { // FIXME condition assumes ASCII
@@ -387,7 +387,8 @@ static int check_blocklist(const char *disk, const sfs_filesystem_t *superblock,
                 fprintf(stderr,
                         "%s: error: first block of %s (id %u) has prev pointer"
                         " referring to block %u\n",
-                        disk, block_label(list_type), cur_id, prev_id);
+                        disk, block_label(list_type), cur_id,
+                        cur_blk->prev_block);
             }
             else if (cur_blk->prev_block == 0)
             {
@@ -515,7 +516,8 @@ static int check_directory_entries(const char *disk,
         }
         if (!name_err && !saw_nonnul)
         {
-            fprintf(stderr, "%s: error: dir entry %zu: invalid name (all NULs)",
+            fprintf(stderr,
+                    "%s: error: dir entry %zu: invalid name (all NULs)\n",
                     disk, i);
             name_err = 1;
         }

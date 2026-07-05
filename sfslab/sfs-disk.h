@@ -4,11 +4,10 @@
     an SFS disk image.
 
     You should not need to change anything in this file, except
-    *maybe* in order to solve some of the X traces (the optional,
-    unscored challenges: run `make x-traces` and see the "Optional
-    challenges (X traces)" section of SFS_Lab_Writeup.md).  If you do
-    change something in this file, make sure to modify sfs-fsck.c to
-    match, as well as sfs-disk.c. */
+    *maybe* in order to tackle one of the optional challenges
+    mentioned in the comments in sfs-disk.c.  If you do change
+    something in this file, make sure to modify sfs-fsck.c to match,
+    as well as sfs-disk.c. */
 
 #ifndef SFS_DISK_H_
 #define SFS_DISK_H_ 1
