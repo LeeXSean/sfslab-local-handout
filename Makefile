@@ -27,8 +27,8 @@ dist:
 	mkdir "$$tmp/$(HANDOUT)"; \
 	cp -R "$(HANDOUT)/." "$$tmp/$(HANDOUT)/"; \
 	cp sfslab.pdf "$$tmp/"; \
-	find "$$tmp/$(HANDOUT)" -type d -exec chmod 755 {} +; \
-	find "$$tmp/$(HANDOUT)" -type f -exec chmod 644 {} +; \
+	find "$$tmp" -type d -exec chmod 755 {} +; \
+	find "$$tmp" -type f -exec chmod 644 {} +; \
 	tar --sort=name --mtime='$(DIST_MTIME)' \
 	  --owner=0 --group=0 --numeric-owner -C "$$tmp" -cf "$(DIST)" "$(HANDOUT)" sfslab.pdf
 	@echo "built $(DIST)"
