@@ -39,13 +39,15 @@ jobs:
           grep -Eq "WARNING: ThreadSanitizer|Subtotal:" /tmp/tsan.log \
             || { cat /tmp/tsan.log; exit 1; }
 
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends groff-base ghostscript
+
       - name: Rebuild handout tarball and compare to committed copy
         run: |
           make dist
           git diff --exit-code -- sfslab-handout.tar
 
       - name: Build writeup PDF
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends groff-base ghostscript
-          make -B pdf
+        run: make -B pdf
