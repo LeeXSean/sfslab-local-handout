@@ -24,7 +24,7 @@ lab, not a packaging bug.
 ## Repository Layout
 
 ```text
-sfslab-handout.tar   packaged copy of sfslab/ (what a student downloads)
+sfslab-handout.tar   packaged copy of sfslab/ plus sfslab.pdf
 sfslab.pdf           the lab writeup
 sfslab/              handout working directory (source of the tarball)
 writeup/             groff source for sfslab.pdf (make pdf)
