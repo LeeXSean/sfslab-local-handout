@@ -18,6 +18,27 @@ jobs:
           cd sfslab
           ./test-sfs -q && exit 1 || test $? -eq 1
 
+      # The graded TSan sweep only runs at 12/12, which the starter never
+      # reaches, so exercise the machinery directly: the self-compile
+      # command must work and the TSan runtime must start (functional
+      # failures of the unlocked starter under real concurrency are
+      # expected and fine).  This catches bit-rot in the embedded compile
+      # command and TSan/ASLR breakage in the environment.
+      - name: TSan machinery sanity (starter)
+        run: |
+          cd sfslab
+          gcc -std=c11 -g -fsanitize=thread -pthread -D_GNU_SOURCE=1 -I. \
+              -o test-sfs-tsan test-sfs.c sfs-disk.c sfs-support.c
+          timeout 20s ./test-sfs-tsan --tsan-only --sched-fuzz=1 \
+              > /tmp/tsan.log 2>&1 || true
+          if grep -q "FATAL: ThreadSanitizer" /tmp/tsan.log; then
+            timeout 20s setarch "$(uname -m)" -R ./test-sfs-tsan --tsan-only \
+                --sched-fuzz=1 > /tmp/tsan.log 2>&1 || true
+          fi
+          ! grep -q "FATAL: ThreadSanitizer" /tmp/tsan.log
+          grep -Eq "WARNING: ThreadSanitizer|Subtotal:" /tmp/tsan.log \
+            || { cat /tmp/tsan.log; exit 1; }
+
       - name: Rebuild handout tarball and compare to committed copy
         run: |
           make dist
@@ -27,4 +48,4 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends groff-base ghostscript
-          make pdf
+          make -B pdf

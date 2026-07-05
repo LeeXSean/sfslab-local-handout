@@ -32,9 +32,14 @@ dist:
 
 # Build the writeup PDF from its groff source.  The source carries its own
 # macro definitions, so this needs only groff-base and ghostscript (ps2pdf),
-# both standard on Linux.
+# both standard on Linux.  The Omit* flags suppress ghostscript's embedded
+# timestamps and document IDs, so rebuilding on the same toolchain is
+# byte-identical and does not dirty the committed sfslab.pdf.  (Different
+# ghostscript versions may still produce different bytes; CI therefore
+# builds the PDF but does not compare it.)
 .PHONY: pdf
 pdf: sfslab.pdf
 
 sfslab.pdf: writeup/sfslab.roff
-	groff -t -Tps writeup/sfslab.roff | ps2pdf - $@
+	groff -t -Tps writeup/sfslab.roff | \
+	  ps2pdf -dOmitInfoDate=true -dOmitXMP=true -dOmitID=true - $@

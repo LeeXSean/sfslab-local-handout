@@ -669,6 +669,31 @@ static int trace_B01(void)
     CHECK(nr == 5 && memcmp(buf, "AAAAA", 5) == 0,
           "read from beginning after seek-back: data mismatch");
 
+    /* Overwrite across the block boundary: seek to 498 and write 4
+       bytes, replacing the last two 'A's and the first two 'B's.
+       Verifies that a write after a backward seek lands in the right
+       blocks and leaves the neighbours and the size untouched. */
+    p = sfs_seek(fd, 493);
+    CHECK(p == 498, "seek(493) from 5 -> expected 498, got %zd", p);
+    nw = sfs_write(fd, "WXYZ", 4);
+    CHECK(nw == 4, "cross-boundary overwrite returned %zd", nw);
+    pos = sfs_getpos(fd);
+    CHECK(pos == 502, "getpos after boundary overwrite should be 502, "
+          "got %zd", pos);
+    p = sfs_seek(fd, -12);
+    CHECK(p == 490, "seek(-12) from 502 -> expected 490, got %zd", p);
+    nr = sfs_read(fd, buf, 20);
+    char expect_ov[20];
+    memset(expect_ov, 'A', 8);
+    memcpy(expect_ov + 8, "WXYZ", 4);
+    memset(expect_ov + 12, 'B', 8);
+    CHECK(nr == 20 && memcmp(buf, expect_ov, 20) == 0,
+          "cross-boundary overwrite should read back ...AA WXYZ BB... "
+          "with size unchanged");
+    p = sfs_seek(fd, 9999);
+    CHECK(p == 1200, "cross-boundary overwrite should not grow file; "
+          "seek-to-end returned %zd", p);
+
     sfs_close(fd);
 
     /* Rename + remove workflow */
@@ -800,6 +825,26 @@ static int trace_B02(void)
     nr = sfs_read(fd, buf, 3);
     CHECK(nr == 3 && memcmp(buf, "ZZZ", 3) == 0,
           "read after seek to 0: data mismatch");
+    sfs_close(fd);
+
+    /* interior overwrite after seeking backward: the neighbouring bytes
+       must be preserved and the size must not grow */
+    fd = sfs_open("overwrite.txt");
+    CHECK(fd >= 0, "open overwrite.txt returned %d", fd);
+    CHECK(sfs_write(fd, "abcdef", 6) == 6, "write(\"abcdef\") failed");
+    p = sfs_seek(fd, -4);
+    CHECK(p == 2, "seek(-4) from 6 should be 2, got %zd", p);
+    CHECK(sfs_write(fd, "XY", 2) == 2, "interior write(\"XY\") failed");
+    pos = sfs_getpos(fd);
+    CHECK(pos == 4, "getpos after interior overwrite should be 4, got %zd",
+          pos);
+    p = sfs_seek(fd, -4);
+    CHECK(p == 0, "seek back to 0 returned %zd", p);
+    nr = sfs_read(fd, buf, sizeof buf);
+    CHECK(nr == 6 && memcmp(buf, "abXYef", 6) == 0,
+          "interior overwrite should read back \"abXYef\" with size "
+          "unchanged, got %zd bytes '%.*s'", nr, (int)(nr > 0 ? nr : 0),
+          buf);
     sfs_close(fd);
 
     /* fd-table exhaustion.  The handout's OPEN_FILE_LIMIT (sfs-disk.c)

@@ -435,9 +435,10 @@ A: feature traces (A00\-A04);5;T{
 format/mount, open/close/read/write, getpos, seek, rename
 T}
 B: sequential traces (B00\-B03);4;T{
-remove/list and slot reuse, multi-block seek, error codes and edge cases
-(including full-disk \f(CR\-ENOSPC\fP and descriptor-table
-\f(CR\-EMFILE\fP), rename/list interactions
+remove/list and slot reuse, multi-block seek, overwrite-after-seek data
+integrity, error codes and edge cases (including full-disk
+\f(CR\-ENOSPC\fP and descriptor-table \f(CR\-EMFILE\fP), rename/list
+interactions
 T}
 C: concurrent traces (C00\-C02);3;T{
 concurrent writes to separate files, concurrent reads of a shared file,
