@@ -453,10 +453,16 @@ static int check_superblock(const char *disk,
 
     if (check_blocklist(disk, superblock, bytemap, superblock->freelist, B_free,
                         NULL))
+    {
+        free(bytemap);
         return -1;
+    }
     if (check_blocklist(disk, superblock, bytemap, superblock->next_rootdir,
                         B_rootdir, NULL))
+    {
+        free(bytemap);
         return -1;
+    }
 
     *bytemap_out = bytemap;
     return 0;
@@ -909,6 +915,7 @@ int main(int argc, char **argv)
 
     int status = check_root_directory(disk, superblock, bytemap);
     status |= check_for_lost_blocks(disk, superblock, bytemap);
+    free(bytemap);
 
     if (status == 0 && verbose)
     {
