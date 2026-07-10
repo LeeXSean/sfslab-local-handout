@@ -138,7 +138,7 @@
 .sp 0.6v
 ..
 .\" ---------------------------------------------------------------- title
-.sp 0.35i
+.sp 0.2i
 .ce 1
 .ps 17
 .ft TB
@@ -152,20 +152,17 @@ SFS Lab: Writing a Multithreaded File System
 .ft R
 .sp 0.2v
 .ce 1
-Last updated: July 4, 2026
-.sp 0.6v
+Last updated: July 10, 2026
+.sp 0.35v
 .in 0.55i
 .ll 5.95i
 .ps 9
 .vs 11p
 .ft TI
-This is an independent self-study adaptation of the Shark File System (SFS)
-lab from CMU 15-213/15-513 (Summer 2024).  All original course materials,
-including the SFS code base and the lab design, are the intellectual
-property of Carnegie Mellon University and the 15-213/15-513 course staff.
-This adaptation is a personal self-study project; no affiliation with CMU is
-implied, and nothing here is an official release.  Do not publish completed
-solutions.
+This self-study edition independently adapts the Shark File System (SFS) lab
+from CMU 15-213/15-513 (Summer 2024).  Original materials and lab design
+remain the property of Carnegie Mellon University and course staff.  This is
+not an official release; keep solutions private.
 .ft R
 .ps \n(PS
 .vs \n(VSp
@@ -205,26 +202,21 @@ Autolab, no handin directory, and no course server.  The test driver
 described in Section 6 plays the role of the autograder, and the score it
 prints is the score the lab gives you.
 .PP
-The only file you need to modify is
-.CW sfs-disk.c .
-You must not modify
-.CW sfs-api.h
-(the specification you are implementing), and you should not need to modify
-any other file.  Some ambitious designs for the optional challenges
-mentioned in the
-.CW sfs-disk.c
-comments may require changes to
-.CW sfs-disk.h ;
-if you change that file, you must update
-.CW sfs-fsck.c
-to match.
+The scored student work remains confined to
+.CW sfs-disk.c ;
+do not modify
+.CW sfs-api.h .
+Optional routes may also require synchronized changes to
+.CW sfs-disk.h
+and
+.CW sfs-fsck.c .
 .PP
 The lab is intended for a 64-bit GNU/Linux environment (a native
 installation, WSL2, or a Linux container) with
 .CW gcc ,
 .CW make ,
 and POSIX threads.
-.SEC "Hand Out Instructions"
+.SEC "Handout Instructions"
 .PP
 Start by extracting the handout tarball in a directory where you plan to do
 your work:
@@ -233,6 +225,7 @@ linux> tar xf sfslab-handout.tar
 linux> cd sfslab
 linux> make
 .CE
+.ne 5v
 .LP
 The important files are:
 .LB "\f(CRsfs-disk.c\fP"
@@ -298,11 +291,9 @@ number 0 acts as the NULL pointer, so the superblock can never appear in
 the middle of a chain.  This is the same flavor of design as the classic
 FAT file system, except that the links live inside the blocks themselves.
 .PP
-A file always owns at least one block, even when it is empty: a nonzero
-first-block field is what marks a directory entry as live.  A file of size
-0 to 500 bytes occupies one block, 501 to 1000 bytes two blocks, and so on.
-The end of a file is known both from the size field in its directory entry
-and from the last block's next pointer being 0.
+Every file owns at least one block; a nonzero first-block field marks its
+directory entry live.  Nonempty files use one block per 500 bytes.  The size
+field and the last block's zero next pointer both mark the end of a file.
 .SUB "The provided API"
 .PP
 The public entry points, declared and specified in
@@ -357,23 +348,11 @@ this is the only possible error.  This function is a warm-up to get you
 reading the descriptor bookkeeping in
 .CW sfs-disk.c .
 .LB "\f(CRssize_t sfs_seek(int fd, ssize_t delta)\fP"
-Move the position of
-.CW fd
-by
-.CW delta
-bytes, forward or backward, and return the new position.  If the motion
-would make the position negative, clamp it to 0; if it would move past the
-end of the file, clamp it to the file size.  (This clamping is deliberately
-different from
-.CW lseek (2),
-to make your life simpler.)  Note that a position is not just an integer:
-the descriptor also caches which block the position lies in, so seeking
-across block boundaries means walking the file's block chain.  Given the
-output
-.CW loc
-from an earlier
-.CW sfs_getpos
-call,
+Move \f(CRfd\fP's position by \f(CRdelta\fP bytes and return the result.
+Clamp it to [0, file size], unlike \f(CRlseek(2)\fP.  The descriptor caches
+both byte position and current block, so crossing block boundaries requires
+walking the chain and keeping both fields consistent.  Given a prior
+\f(CRsfs_getpos\fP result \f(CRloc\fP,
 .CW "sfs_seek(fd, loc \- sfs_getpos(fd))"
 must return the descriptor to the earlier position.
 .LB "\f(CRint sfs_rename(const char *old_name, const char *new_name)\fP"
@@ -426,9 +405,13 @@ and stick to it everywhere; two threads that take the same locks in
 opposite orders will deadlock.  The driver's 30-second per-trace timeout
 will catch a deadlock, but a design that cannot deadlock is far more
 pleasant to debug.
-.SEC "Evaluation"
 .PP
-Your score is computed out of 26 points:
+.B "Optional challenges:"
+Zero-block empty files, expandable directories, and Unix unlink are unscored.
+.bp
+.SEC "Evaluation"
+.LP
+The total is 26 points:
 .TS
 center box tab(;);
 lb cb lb
@@ -439,10 +422,8 @@ A: feature traces (A00\-A04);5;T{
 format/mount, open/close/read/write, getpos, seek, rename
 T}
 B: sequential traces (B00\-B03);4;T{
-remove/list and slot reuse, multi-block seek, overwrite and cross-block append
-integrity, error codes and edges (full-disk \f(CR\-ENOSPC\fP, fd-table
-\f(CR\-EMFILE\fP rollback, empty names, oversized writes), rename/list
-interactions
+remove/list and slot reuse, seek/overwrite/append integrity,
+ENOSPC/EMFILE rollback, name/size edges, rename/list
 T}
 C: concurrent traces (C00\-C02);3;T{
 concurrent writes to separate files, concurrent reads of a shared file,
@@ -562,33 +543,17 @@ and tells you to re-run
 Full performance credit always requires a calibrated ratio.
 .SUB "Style (4 points)"
 .PP
-There is no style autograder in this edition; the 4 style points are a
-self-review.  Hold yourself to the standard of the course: consistent
-formatting (a
-.CW .clang-format
-matching the handout style is included), no dead code or stray debug
-output, comments that explain
+The 4 style points are a self-review: use the included
+.CW .clang-format ,
+remove dead code and debug output, explain
 .I why
-rather than what, error paths that clean up after themselves, and locking
-whose correctness a reader can check locally instead of by global
-reasoning.
+instead of what, clean up error paths, and keep locking locally auditable.
 .SEC "Testing Your Work"
 .SUB "The test driver"
 .PP
-Run everything from the handout directory:
-.CS
-linux> ./test-sfs
-.CE
-.LP
-The driver prints the scoreboard described in Section 6.  Two flags control
-verbosity:
-.CW \-q
-suppresses per-check FAIL detail (scoreboard only), and
-.CW \-v
-raises the per-trace detail cap (by default only the first 3 failed checks
-per trace are printed).  The exit status is the correctness gate: 0 once
-all twelve correctness traces pass, 1 otherwise.  The performance score
-never affects the exit status; read it from the scoreboard.
+Run \f(CR./test-sfs\fP from the handout directory.  \f(CR-q\fP hides FAIL
+detail; \f(CR-v\fP removes its default cap.  Performance never affects the
+exit status: it is 0 when all twelve correctness traces pass, otherwise 1.
 .PP
 In a non-quiet run, when a trace fails, the driver saves a copy of its
 surviving disk
@@ -652,15 +617,12 @@ normal correctness pass never fuzzes; only the TSan sweep and explicit
 invocations do.
 .SUB "Calibrating and reading the performance score"
 .PP
-Calibrate once per machine (and again if the machine's configuration
-changes):
-.CS
-linux> make baseline        # writes .perf_baseline (median of 5 runs)
-linux> ./test-sfs           # scored run, prints the ratio
-.CE
-.LP
+Calibrate once per machine with
+.CW "make baseline" ,
+then run
+.CW ./test-sfs ;
 .CW "make grade"
-does both in one step.  The calibration prints a
+does both.  The calibration prints a
 .CW spread
 line; if min and max differ by more than about 10%, the machine was not
 quiet \(em close the browser and re-run.  Use
@@ -668,27 +630,11 @@ quiet \(em close the browser and re-run.  Use
 for a tighter (odd) sample count on noisy machines.
 .SUB "Notes for Docker and WSL users"
 .PP
-If your working directory is bind-mounted from a Windows host (the Docker
-Desktop default), every disk-image operation crosses a slow translation
-layer, and single-run variance of 40\(en70% on the benchmark is normal.
-The 5-sample median absorbs most of it, but if the driver warns that the
-spread exceeds 20%, point the disk images at the container's native
-file system:
-.CS
-linux> export SFS_DISK_DIR=/tmp
-linux> make baseline        # recalibrate in the new location
-linux> ./test-sfs
-.CE
-.LP
-The chosen directory is recorded in
-.CW .perf_baseline ;
-if the calibration and the scored run disagree about
-.CW SFS_DISK_DIR ,
-the driver ignores the ratio and caps the absolute score at 5/10 because the
-measurements use different file systems.  Moving the whole project into the Linux-native
-file system (e.g. under
-.CW "\(rs\(rswsl$\(rsUbuntu\(rshome" )
-is the most robust fix.
+Bind-mounted disk I/O can distort the benchmark.  Run
+\f(CRexport SFS_DISK_DIR=/tmp\fP before both \f(CRmake baseline\fP and
+\f(CR./test-sfs\fP.  The driver records the setting in
+\f(CR.perf_baseline\fP; a mismatch disables ratio scoring and caps performance
+at 5/10.
 .SEC "Hints"
 .BU
 Implement
@@ -722,13 +668,6 @@ that reads happen not to notice; the checker notices.
 Be careful with the operations that touch global state: the free list,
 the directory, and the open-file tables.  Each can have its own small
 lock, but fix a lock order.
-.BU
-The comments in
-.CW sfs-disk.c
-mention several optional design challenges (zero-block empty files,
-growing the directory past 15 entries, Unix-style delete-while-open).
-They are not graded; they are there if you finish early and want to keep
-going.
 .EL
 .APP "Appendix: Frequently Asked Questions"
 .LB "\(lqNo space left on device\(rq"
