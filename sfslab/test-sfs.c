@@ -13,12 +13,14 @@
  */
 
 #include "sfs-api.h"
+#include "sfs-disk.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <poll.h>
+#include <stddef.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -259,6 +261,19 @@ static size_t disk_size(void)
 {
     long ps = sysconf(_SC_PAGESIZE);
     return (size_t)ps * 64;
+}
+
+static int overwrite_first_file_size(uint32_t size)
+{
+    int fd = open(DISK_NAME, O_RDWR);
+    if (fd < 0)
+        return -errno;
+    off_t offset = (off_t)offsetof(sfs_filesystem_t, files[0].size);
+    ssize_t written = pwrite(fd, &size, sizeof size, offset);
+    int result = written == (ssize_t)sizeof size ? 0 : -EIO;
+    if (close(fd) != 0 && result == 0)
+        result = -errno;
+    return result;
 }
 
 static void compact_fsck_output(char out[])
@@ -838,12 +853,12 @@ static int trace_B02(void)
     CHECK(fd >= 0, "open busy.txt returned %d", fd);
     CHECK(sfs_write(fd, "busy", 4) == 4, "write busy.txt failed");
     r = sfs_remove("busy.txt");
-    CHECK(r == -EBUSY, "remove(open file) should be -EBUSY, got %d", r);
+    CHECK(r == 0, "remove(open file) should use Unix semantics, got %d", r);
     r = sfs_unmount();
     CHECK(r == -EBUSY, "unmount with open file should be -EBUSY, got %d", r);
     sfs_close(fd);
     r = sfs_remove("busy.txt");
-    CHECK(r == 0, "remove busy.txt after close returned %d", r);
+    CHECK(r == -ENOENT, "unlinked busy.txt should stay absent, got %d", r);
 
     /* write exactly BLOCK_DATA_SIZE bytes (boundary condition) */
     fd = sfs_open("boundary.txt");
@@ -946,10 +961,8 @@ static int trace_B02(void)
 
     unmount_and_check(DISK_NAME);
 
-    /* disk-space exhaustion, on the smallest image sfs_format accepts:
-       one page holds pagesize/512 blocks, one of which is the superblock.
-       A file's first block comes with creation; each further 500-byte
-       write allocates exactly one more. */
+    /* Disk-space exhaustion on the smallest accepted image.  Empty files use
+       no data block on the developer branch. */
     size_t pagesz = (size_t)sysconf(_SC_PAGESIZE);
     size_t data_blocks = pagesz / 512 - 1;
     r = sfs_format(DISK_NAME, pagesz);
@@ -967,9 +980,12 @@ static int trace_B02(void)
     CHECK(nw == -ENOSPC, "write on a full disk should be -ENOSPC, got %zd",
           nw);
     int fdfull = sfs_open("nofit");
-    CHECK(fdfull == -ENOSPC,
-          "creating a file on a full disk should be -ENOSPC, got %d",
-          fdfull);
+    CHECK(fdfull >= 0,
+          "creating an empty file on a full disk returned %d", fdfull);
+    CHECK(sfs_write(fdfull, "x", 1) == -ENOSPC,
+          "growing an empty file on a full disk should be -ENOSPC");
+    sfs_close(fdfull);
+    CHECK(sfs_remove("nofit") == 0, "remove empty nofit failed");
     sfs_close(fd);
 
     /* removing the file frees its blocks again */
@@ -1093,6 +1109,316 @@ static int trace_B03(void)
           "cookie must be reset to NULL on a nonzero return (still %p)",
           cookie);
 
+    unmount_and_check(DISK_NAME);
+    return trace_ok;
+}
+
+/* ================================================================== */
+/*  Category D -- Developer Extensions (not scored)                    */
+/* ================================================================== */
+
+static int trace_D00(void)
+{
+    trace_ok = 1;
+    int r = sfs_format(DISK_NAME, disk_size());
+    CHECK(r == 0, "developer format returned %d", r);
+    if (r != 0)
+        return trace_ok;
+
+    CHECK(sfs_fstat(-1) == -EBADF, "fstat(-1) should be -EBADF");
+    CHECK(sfs_ftruncate(-1, 0) == -EBADF,
+          "ftruncate(-1) should be -EBADF");
+
+    int fd = sfs_open("sized");
+    int fd2 = sfs_open("sized");
+    CHECK(fd >= 0 && fd2 >= 0, "opening sized twice failed");
+    if (fd < 0 || fd2 < 0)
+        goto out_first;
+    CHECK(sfs_fstat(fd) == 0, "new file size should be 0");
+    CHECK(sfs_write(fd, "abc", 3) == 3, "initial write failed");
+    CHECK(sfs_fstat(fd2) == 3, "second fd should observe size 3");
+
+    CHECK(sfs_ftruncate(fd2, 700) == 0, "grow to 700 failed");
+    CHECK(sfs_fstat(fd) == 700, "grown size should be 700");
+    sfs_close(fd);
+    sfs_close(fd2);
+
+    fd = sfs_open("sized");
+    char data[700];
+    ssize_t nr = sfs_read(fd, data, sizeof data);
+    CHECK(nr == (ssize_t)sizeof data, "grown file read returned %zd", nr);
+    CHECK(memcmp(data, "abc", 3) == 0, "grow changed existing bytes");
+    int zero = 1;
+    for (size_t i = 3; i < sizeof data; i++)
+        if (data[i] != 0)
+            zero = 0;
+    CHECK(zero, "grown region was not zero-filled");
+
+    fd2 = sfs_open("sized");
+    CHECK(sfs_ftruncate(fd2, 2) == 0, "shrink to 2 failed");
+    CHECK(sfs_read(fd, data, 1) == 0,
+          "shrink should clamp another fd to the new end");
+    CHECK(sfs_write(fd, "Z", 1) == 1,
+          "write through a clamped descriptor failed");
+    CHECK(sfs_fstat(fd2) == 3, "post-clamp write should set size 3");
+    sfs_close(fd);
+    sfs_close(fd2);
+
+    fd = sfs_open("sized");
+    memset(data, 0x5a, sizeof data);
+    nr = sfs_read(fd, data, 3);
+    CHECK(nr == 3 && memcmp(data, "abZ", 3) == 0,
+          "shrink/clamp data mismatch");
+    CHECK(sfs_ftruncate(fd, 0) == 0, "truncate to zero failed");
+    CHECK(sfs_ftruncate(fd, 501) == 0, "regrow to 501 failed");
+    sfs_close(fd);
+
+    fd = sfs_open("sized");
+    nr = sfs_read(fd, data, 501);
+    zero = nr == 501;
+    for (size_t i = 0; i < 501 && zero; i++)
+        if (data[i] != 0)
+            zero = 0;
+    CHECK(zero, "truncate-to-zero then regrow exposed stale bytes");
+    sfs_close(fd);
+
+out_first:
+    if (fd >= 0)
+        sfs_close(fd);
+    if (fd2 >= 0)
+        sfs_close(fd2);
+    unmount_and_check(DISK_NAME);
+
+    size_t pagesz = (size_t)sysconf(_SC_PAGESIZE);
+    size_t capacity = (pagesz / 512 - 1) * 500;
+
+    /* Version-1 images may contain the original one-block representation of
+       an empty file.  Recreate one and ensure write does not leak a new block. */
+    r = sfs_format(DISK_NAME, pagesz);
+    CHECK(r == 0, "legacy-write format returned %d", r);
+    fd = sfs_open("legacy-write");
+    CHECK(fd >= 0 && sfs_write(fd, "L", 1) == 1,
+          "legacy-write fixture creation failed");
+    sfs_close(fd);
+    CHECK(sfs_unmount() == 0, "legacy-write fixture unmount failed");
+    CHECK(overwrite_first_file_size(0) == 0,
+          "legacy-write size patch failed");
+    check_disk_consistency(DISK_NAME);
+    r = sfs_mount(DISK_NAME);
+    CHECK(r == 0, "legacy-write mount returned %d", r);
+    if (r == 0)
+    {
+        fd = sfs_open("legacy-write");
+        CHECK(fd >= 0 && sfs_write(fd, "Z", 1) == 1,
+              "write to legacy empty file failed");
+        sfs_close(fd);
+        unmount_and_check(DISK_NAME);
+    }
+
+    /* The same compatibility path must count the existing block when growing
+       with ftruncate; otherwise a full-capacity grow falsely returns ENOSPC. */
+    r = sfs_format(DISK_NAME, pagesz);
+    CHECK(r == 0, "legacy-truncate format returned %d", r);
+    fd = sfs_open("legacy-truncate");
+    CHECK(fd >= 0 && sfs_write(fd, "L", 1) == 1,
+          "legacy-truncate fixture creation failed");
+    sfs_close(fd);
+    CHECK(sfs_unmount() == 0, "legacy-truncate fixture unmount failed");
+    CHECK(overwrite_first_file_size(0) == 0,
+          "legacy-truncate size patch failed");
+    check_disk_consistency(DISK_NAME);
+    r = sfs_mount(DISK_NAME);
+    CHECK(r == 0, "legacy-truncate mount returned %d", r);
+    if (r == 0)
+    {
+        fd = sfs_open("legacy-truncate");
+        CHECK(fd >= 0 && sfs_ftruncate(fd, capacity) == 0,
+              "legacy empty file could not grow to disk capacity");
+        char byte = 1;
+        CHECK(fd >= 0 && sfs_read(fd, &byte, 1) == 1 && byte == 0,
+              "legacy empty file growth exposed stale data");
+        sfs_close(fd);
+        unmount_and_check(DISK_NAME);
+    }
+
+    r = sfs_format(DISK_NAME, pagesz);
+    CHECK(r == 0, "tiny developer format returned %d", r);
+    if (r != 0)
+        return trace_ok;
+    fd = sfs_open("capacity");
+    CHECK(fd >= 0, "open capacity failed");
+    if (fd >= 0)
+    {
+        CHECK(sfs_ftruncate(fd, capacity) == 0,
+              "truncate to disk capacity failed");
+        CHECK(sfs_ftruncate(fd, capacity + 1) == -ENOSPC,
+              "over-capacity truncate should be -ENOSPC");
+        CHECK(sfs_fstat(fd) == (ssize_t)capacity,
+              "failed truncate changed the file size");
+        CHECK(sfs_ftruncate(fd, SIZE_MAX) == -EFBIG,
+              "oversized truncate should be -EFBIG");
+        CHECK(sfs_fstat(fd) == (ssize_t)capacity,
+              "oversized truncate changed the file size");
+        CHECK(sfs_ftruncate(fd, 0) == 0,
+              "truncate-to-zero did not release the full disk");
+        int reuse = sfs_open("reuse-capacity");
+        CHECK(reuse >= 0 && sfs_ftruncate(reuse, capacity) == 0,
+              "released truncate blocks could not be reused");
+        sfs_close(reuse);
+        sfs_close(fd);
+    }
+    unmount_and_check(DISK_NAME);
+    return trace_ok;
+}
+
+static int trace_X00(void)
+{
+    trace_ok = 1;
+    size_t disk_bytes = (size_t)sysconf(_SC_PAGESIZE);
+    size_t data_blocks = disk_bytes / 512 - 1;
+    int r = sfs_format(DISK_NAME, disk_bytes);
+    CHECK(r == 0, "X00 format returned %d", r);
+    if (r != 0)
+        return trace_ok;
+
+    for (int i = 0; i < 5; i++)
+    {
+        char name[SFS_FILE_NAME_SIZE_LIMIT];
+        snprintf(name, sizeof name, "empty%d", i);
+        int fd = sfs_open(name);
+        CHECK(fd >= 0, "X00 open %s returned %d", name, fd);
+        sfs_close(fd);
+    }
+    int fd = sfs_open("big");
+    CHECK(fd >= 0, "X00 open big returned %d", fd);
+    char block[500];
+    memset(block, 'X', sizeof block);
+    for (size_t i = 0; i < data_blocks && fd >= 0; i++)
+        CHECK(sfs_write(fd, block, sizeof block) == (ssize_t)sizeof block,
+              "X00 data block %zu of %zu did not fit", i + 1,
+              data_blocks);
+    sfs_close(fd);
+    unmount_and_check(DISK_NAME);
+    r = sfs_mount(DISK_NAME);
+    CHECK(r == 0, "X00 remount returned %d", r);
+    if (r == 0)
+    {
+        sfs_list_cookie cookie = NULL;
+        char name[SFS_FILE_NAME_SIZE_LIMIT];
+        int count = 0;
+        while (sfs_list(&cookie, name, sizeof name) == 0)
+            count++;
+        CHECK(count == 6, "X00 remount listed %d files", count);
+        unmount_and_check(DISK_NAME);
+    }
+    return trace_ok;
+}
+
+#define X01_FILES 260
+static int trace_X01(void)
+{
+    trace_ok = 1;
+    int r = sfs_format(DISK_NAME, disk_size());
+    CHECK(r == 0, "X01 format returned %d", r);
+    if (r != 0)
+        return trace_ok;
+
+    for (int i = 0; i < X01_FILES; i++)
+    {
+        char name[SFS_FILE_NAME_SIZE_LIMIT];
+        snprintf(name, sizeof name, "ext%02d", i);
+        int fd = sfs_open(name);
+        CHECK(fd >= 0, "X01 open %s returned %d", name, fd);
+        if (fd >= 0)
+        {
+            char byte = (char)('a' + i);
+            CHECK(sfs_write(fd, &byte, 1) == 1,
+                  "X01 write %s failed", name);
+            sfs_close(fd);
+        }
+    }
+
+    char seen[X01_FILES] = {0};
+    sfs_list_cookie cookie = NULL;
+    char name[SFS_FILE_NAME_SIZE_LIMIT];
+    int count = 0;
+    int status;
+    while ((status = sfs_list(&cookie, name, sizeof name)) == 0)
+    {
+        int index = strncmp(name, "ext", 3) == 0 ? atoi(name + 3) : -1;
+        CHECK(index >= 0 && index < X01_FILES && !seen[index],
+              "X01 listed unexpected name %s", name);
+        if (index >= 0 && index < X01_FILES)
+            seen[index] = 1;
+        count++;
+    }
+    CHECK(status == 1 && count == X01_FILES,
+          "X01 list ended %d after %d files", status, count);
+
+    int fd = sfs_open("ext19");
+    char byte = 0;
+    CHECK(fd >= 0 && sfs_read(fd, &byte, 1) == 1 && byte == 't',
+          "X01 extended-directory read-back failed");
+    sfs_close(fd);
+    for (int i = 0; i < X01_FILES; i++)
+    {
+        snprintf(name, sizeof name, "ext%02d", i);
+        CHECK(sfs_remove(name) == 0, "X01 remove %s failed", name);
+    }
+    fd = sfs_open("reused");
+    CHECK(fd >= 0, "X01 could not reuse a directory slot");
+    sfs_close(fd);
+    unmount_and_check(DISK_NAME);
+    r = sfs_mount(DISK_NAME);
+    CHECK(r == 0, "X01 remount returned %d", r);
+    if (r == 0)
+    {
+        sfs_list_cookie remount_cookie = NULL;
+        int remount_count = 0;
+        while (sfs_list(&remount_cookie, name, sizeof name) == 0)
+            remount_count++;
+        CHECK(remount_count == 1 && strcmp(name, "reused") == 0,
+              "X01 remount did not preserve reused entry");
+        unmount_and_check(DISK_NAME);
+    }
+    return trace_ok;
+}
+
+static int trace_X02(void)
+{
+    trace_ok = 1;
+    int r = sfs_format(DISK_NAME, disk_size());
+    CHECK(r == 0, "X02 format returned %d", r);
+    if (r != 0)
+        return trace_ok;
+
+    int writer = sfs_open("victim");
+    CHECK(writer >= 0 && sfs_write(writer, "DATA", 4) == 4,
+          "X02 initial write failed");
+    int reader = sfs_open("victim");
+    CHECK(reader >= 0, "X02 second open failed");
+    CHECK(sfs_remove("victim") == 0,
+          "X02 remove of open file should succeed");
+
+    sfs_list_cookie cookie = NULL;
+    char name[SFS_FILE_NAME_SIZE_LIMIT];
+    CHECK(sfs_list(&cookie, name, sizeof name) == 1,
+          "X02 unlinked name remained visible");
+    char data[8] = {0};
+    CHECK(sfs_read(reader, data, 4) == 4 && memcmp(data, "DATA", 4) == 0,
+          "X02 reader lost unlinked data");
+    CHECK(sfs_write(writer, "MORE", 4) == 4,
+          "X02 writer could not append after unlink");
+    CHECK(sfs_read(reader, data, 4) == 4 && memcmp(data, "MORE", 4) == 0,
+          "X02 reader did not observe post-unlink append");
+
+    int fresh = sfs_open("victim");
+    CHECK(fresh >= 0 && sfs_read(fresh, data, 1) == 0,
+          "X02 reopening name did not create a distinct empty file");
+    sfs_close(fresh);
+    CHECK(sfs_remove("victim") == 0, "X02 fresh file removal failed");
+    sfs_close(reader);
+    sfs_close(writer);
     unmount_and_check(DISK_NAME);
     return trace_ok;
 }
@@ -1623,7 +1949,7 @@ static int trace_C02(void)
 #define PERF_OUTER_ITERS 16000
 #define PERF_IO_ROUNDS 10
 #define PERF_CALLS_PER_THREAD (PERF_OUTER_ITERS * (2 + 4 * PERF_IO_ROUNDS))
-#define PERF_WORKLOAD_VERSION "v3"
+#define PERF_WORKLOAD_VERSION "v4"
 
 /* Scored perf benchmark samples this many times and uses the median.
    Matches baseline calibration (make baseline BASELINE_RUNS=N); odd so
@@ -2134,7 +2460,7 @@ static void capture_append(char **pbuf, size_t *plen, const char *src,
 static int run_trace_with_timeout(const char *id, trace_fn fn,
                                   char **out_buf, size_t *out_len)
 {
-    *out_buf = malloc(TRACE_CAPTURE_LIMIT);
+    *out_buf = NULL;
     *out_len = 0;
 
     fflush(stdout);
@@ -2170,6 +2496,7 @@ static int run_trace_with_timeout(const char *id, trace_fn fn,
     }
 
     /* Parent: drain pipe while polling for child exit. */
+    *out_buf = malloc(TRACE_CAPTURE_LIMIT);
     close(pfd[1]);
     int flags = fcntl(pfd[0], F_GETFL);
     if (flags >= 0) fcntl(pfd[0], F_SETFL, flags | O_NONBLOCK);
@@ -2320,6 +2647,8 @@ int main(int argc, char *argv[])
 
     int mode_tsan_only = 0;
     int mode_perf_only = 0;
+    int mode_developer_only = 0;
+    int mode_x_only = 0;
     for (int i = 1; i < argc; i++)
     {
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0)
@@ -2330,6 +2659,10 @@ int main(int argc, char *argv[])
             mode_tsan_only = 1;
         else if (strcmp(argv[i], "--perf-only") == 0)
             mode_perf_only = 1;
+        else if (strcmp(argv[i], "--developer-only") == 0)
+            mode_developer_only = 1;
+        else if (strcmp(argv[i], "--x-only") == 0)
+            mode_x_only = 1;
         else if (strcmp(argv[i], "--sched-fuzz") == 0)
             sched_fuzz_seed = 1;
         else if (strncmp(argv[i], "--sched-fuzz=", 13) == 0)
@@ -2382,6 +2715,34 @@ int main(int argc, char *argv[])
                     "this number is not meaningful\n");
         unlink(DISK_NAME);
         return failed ? 1 : 0;
+    }
+
+    if (mode_developer_only)
+    {
+        struct trace_entry dev[] = {
+            {"D00", "fstat_ftruncate", trace_D00},
+        };
+        printf("========================================\n");
+        printf("       SFS Developer Extensions\n");
+        printf("========================================\n");
+        int passed = run_category("D (not scored)", dev, 1);
+        unlink(DISK_NAME);
+        return passed == 1 ? 0 : 1;
+    }
+
+    if (mode_x_only)
+    {
+        struct trace_entry optional[] = {
+            {"X00", "zero_block_empty", trace_X00},
+            {"X01", "directory_expansion", trace_X01},
+            {"X02", "unix_remove", trace_X02},
+        };
+        printf("========================================\n");
+        printf("       SFS Optional Challenges\n");
+        printf("========================================\n");
+        int passed = run_category("X (not scored)", optional, 3);
+        unlink(DISK_NAME);
+        return passed == 3 ? 0 : 1;
     }
 
     struct trace_entry cat_a[] = {

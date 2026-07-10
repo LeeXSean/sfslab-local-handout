@@ -62,3 +62,7 @@ machine changes):
 "make grade" runs the calibration and the autograder in one step.
 Run everything from this directory; the driver expects ./sfs-fsck
 and ./.perf_baseline to be reachable from the working directory.
+
+Developer branch only: "make developer-test" checks sfs_fstat and
+sfs_ftruncate, and "make x-traces" checks the three unscored optional
+design routes.  These checks do not affect the 22-point score.

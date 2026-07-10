@@ -33,6 +33,11 @@ writeup/             groff source for sfslab.pdf (make pdf)
 Maintainer targets, from the repository root: `make dist` rebuilds the
 tarball deterministically; `make pdf` rebuilds the writeup.
 
+The `developer` branch additionally implements the historical file-size and
+optional-design routes. They are unscored and exercised by `make
+developer-test` and `make x-traces`; see `docs/maintainer/DEVELOPER.md`. Use
+`main` for the course-shaped starter.
+
 ## Disclaimer
 
 Original SFS lab materials belong to Carnegie Mellon University and the

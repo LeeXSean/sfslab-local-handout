@@ -3,11 +3,9 @@
     in this file is connected somehow to the data actually stored in
     an SFS disk image.
 
-    You should not need to change anything in this file, except
-    *maybe* in order to tackle one of the optional challenges
-    mentioned in the comments in sfs-disk.c.  If you do change
-    something in this file, make sure to modify sfs-fsck.c to match,
-    as well as sfs-disk.c. */
+    The developer branch extends the original format with a reserved empty-file
+    sentinel.  Keep sfs-fsck.c and sfs-disk.c synchronized with any further
+    changes here. */
 
 #ifndef SFS_DISK_H_
 #define SFS_DISK_H_ 1
@@ -48,6 +46,11 @@
     "not in use", things like that.  */
 typedef uint32_t block_id;
 
+/** Developer-branch encoding for a live empty file with no data block.
+    Valid block IDs are always smaller than the uint32_t block count, so this
+    value can never name a mapped block. */
+#define SFS_EMPTY_FILE_BLOCK UINT32_MAX
+
 /** The superblock stores the number of blocks in a uint32_t, so the largest
     representable image contains UINT32_MAX blocks.  We presume that size_t
     and off_t can both hold this number.  */
@@ -86,7 +89,7 @@ typedef struct sfs_block_file_t
     information: */
 typedef struct sfs_dir_entry_t
 {
-    block_id first_block; /**< First block of file (0 = dir entry is unused) */
+    block_id first_block; /**< First block; 0 = unused, EMPTY sentinel = no data */
     uint32_t size;        /**< Size of file in bytes */
     char name[SFS_FILE_NAME_SIZE_LIMIT]; /**< NUL-terminated name */
 } sfs_dir_entry_t;

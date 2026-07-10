@@ -3,7 +3,8 @@
     each function carefully.  You are implementing this specification;
     the doc comment for each function tells you what it is supposed to do.
 
-    Do not change anything in this file.  */
+    Students should not change this file.  The developer branch extends the
+    course-shaped API with the explicitly marked, unscored size operations. */
 
 #ifndef SFS_API_H_
 #define SFS_API_H_ 1
@@ -74,6 +75,8 @@ int sfs_unmount(void);
 
     An empty file name is invalid and returns -EINVAL.
     If creating a new file fails, no directory entry or data block is retained.
+    Empty files consume no data block, and the root directory grows by chaining
+    directory blocks when its embedded entries are full.
 
     Return a non-negative "file descriptor" on success, or a negative
     error code.  (The "file descriptor" can only be used with other
@@ -115,6 +118,21 @@ ssize_t sfs_read(int fd, char *buf, size_t len);
     negative error code.  */
 ssize_t sfs_write(int fd, const char *buf, size_t len);
 
+/** Return the current size of the file referred to by FD.  This is SFS's
+    compact equivalent of fstat(): SFS has no metadata beyond the file size.
+
+    If FD is not valid, return -EBADF. */
+ssize_t sfs_fstat(int fd);
+
+/** Change the size of the file referred to by FD to LENGTH bytes.  Growing a
+    file zero-fills the new region.  Shrinking releases whole blocks beyond
+    the new end and clamps every open descriptor for the same file to the new
+    end when necessary.
+
+    The operation is atomic on allocation failure: -ENOSPC or -EFBIG leaves
+    the file contents, size, and descriptor positions unchanged. */
+int sfs_ftruncate(int fd, size_t length);
+
 /** Return the current file position of "file descriptor" FD.  If FD
     is not a valid "file descriptor", return -EBADF; this is the
     only reason this function might fail.  */
@@ -134,6 +152,10 @@ ssize_t sfs_getpos(int fd);
 ssize_t sfs_seek(int fd, ssize_t delta);
 
 /** Delete the file named NAME.
+    If the file is open, its name disappears immediately but existing
+    descriptors remain usable; its blocks are reclaimed after the last close.
+    Opening NAME again creates a distinct new file.
+
     Returns 0 on success, or a negative error code, such as:
 
     -ENOENT          The file already doesn't exist.

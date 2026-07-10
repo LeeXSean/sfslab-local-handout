@@ -152,7 +152,7 @@ SFS Lab: Writing a Multithreaded File System
 .ft R
 .sp 0.2v
 .ce 1
-Last updated: July 4, 2026
+Last updated: July 9, 2026
 .sp 0.6v
 .in 0.55i
 .ll 5.95i
@@ -210,14 +210,12 @@ The only file you need to modify is
 You must not modify
 .CW sfs-api.h
 (the specification you are implementing), and you should not need to modify
-any other file.  Some ambitious designs for the optional challenges
-mentioned in the
-.CW sfs-disk.c
-comments may require changes to
-.CW sfs-disk.h ;
-if you change that file, you must update
+any other file.  This developer branch already extends
+.CW sfs-disk.h
+and
 .CW sfs-fsck.c
-to match.
+for its optional routes; keep those files synchronized if you make further
+on-disk format changes.
 .PP
 The lab is intended for a 64-bit GNU/Linux environment (a native
 installation, WSL2, or a Linux container) with
@@ -287,7 +285,11 @@ it identifies the image (a magic number), records the total number of
 blocks, and embeds the root directory: an array of 15 fixed-size directory
 entries, each holding a file name (at most 23 characters plus a terminating
 NUL), the file's size in bytes, and the block number of the file's first
-block.  A directory entry whose first-block field is zero is unused.
+block.  A directory entry whose first-block field is zero is unused.  When
+those entries fill, the developer branch chains additional directory blocks
+through the superblock's
+.CW next_rootdir
+field.
 .PP
 Every other block begins with a 12-byte header containing a type tag and
 the block numbers of the previous and next blocks in whatever chain the
@@ -298,9 +300,11 @@ number 0 acts as the NULL pointer, so the superblock can never appear in
 the middle of a chain.  This is the same flavor of design as the classic
 FAT file system, except that the links live inside the blocks themselves.
 .PP
-A file always owns at least one block, even when it is empty: a nonzero
-first-block field is what marks a directory entry as live.  A file of size
-0 to 500 bytes occupies one block, 501 to 1000 bytes two blocks, and so on.
+A developer-branch empty file owns no data block; its first-block field uses
+the reserved
+.CW SFS_EMPTY_FILE_BLOCK
+sentinel.  A nonempty file of size 1 to 500 bytes occupies one block, 501 to
+1000 bytes two blocks, and so on.
 The end of a file is known both from the size field in its directory entry
 and from the last block's next pointer being 0.
 .SUB "The provided API"
@@ -327,9 +331,13 @@ Read or write up to
 .CW len
 bytes at the descriptor's current position, advancing the position.  Writes
 extend the file (and allocate blocks) as needed.
+.LB "\f(CRsfs_fstat(fd)\fP / \f(CRsfs_ftruncate(fd, length)\fP"
+Developer-branch, unscored extensions: query a file's size, or resize it with
+zero-fill on growth and block reclamation on shrink.
 .LB "\f(CRsfs_remove(name)\fP"
-Delete a file.  Deleting an open file fails with
-.CW \-EBUSY .
+Delete a file.  On the developer branch an open file is unlinked immediately,
+remains usable through existing descriptors, and is reclaimed after the last
+close.
 .LB "\f(CRsfs_list(cookie, filename_out, filename_space)\fP"
 Iterate over the directory, returning one file name per call.
 .EL
@@ -607,6 +615,9 @@ verifies the structural integrity of a disk image: mislabeled blocks,
 invalid directory entries, file sizes that disagree with the number of
 allocated blocks, inconsistent or circular block chains, blocks on more
 than one chain, and orphaned blocks on no chain at all.
+On the developer branch its ownership map also scales past 250 files and it
+accepts both the original one-block and developer zero-block empty-file
+encodings.
 .PP
 The driver names its working images
 .CW test.img
@@ -723,12 +734,11 @@ Be careful with the operations that touch global state: the free list,
 the directory, and the open-file tables.  Each can have its own small
 lock, but fix a lock order.
 .BU
-The comments in
-.CW sfs-disk.c
-mention several optional design challenges (zero-block empty files,
-growing the directory past 15 entries, Unix-style delete-while-open).
-They are not graded; they are there if you finish early and want to keep
-going.
+Developer-only routes remain unscored:
+.CW make\ x-traces
+checks zero-block empty files, directory growth, and Unix unlink;
+.CW make\ developer-test
+checks file sizing.
 .EL
 .APP "Appendix: Frequently Asked Questions"
 .LB "\(lqNo space left on device\(rq"

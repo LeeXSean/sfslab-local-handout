@@ -30,6 +30,15 @@ test: test-sfs sfs-fsck
 	./test-sfs
 .PHONY: test
 
+# Developer-branch extensions; deliberately outside the 22-point score.
+developer-test: test-sfs sfs-fsck
+	./test-sfs --developer-only
+.PHONY: developer-test
+
+x-traces: test-sfs sfs-fsck
+	./test-sfs --x-only
+.PHONY: x-traces
+
 # Baseline calibration: run the reference benchmark BASELINE_RUNS times
 # and write the median to .perf_baseline, smoothing over per-run jitter
 # (thermal, scheduler noise).  Keep BASELINE_RUNS odd so the median is
@@ -57,7 +66,7 @@ baseline: test-sfs-baseline
 	  | awk -v n=$(BASELINE_RUNS) 'NR==int((n+1)/2){print; exit}' \
 	  > .perf_baseline
 	@printf 'SFS_DISK_DIR=%s\n' "$${SFS_DISK_DIR:-(unset)}" >> .perf_baseline
-	@printf 'WORKLOAD=v3\n' >> .perf_baseline  # keep in sync with PERF_WORKLOAD_VERSION (test-sfs.c)
+	@printf 'WORKLOAD=v4\n' >> .perf_baseline  # keep in sync with PERF_WORKLOAD_VERSION (test-sfs.c)
 	@awk 'NR==1{min=$$1; max=$$1} \
 	      {if($$1<min)min=$$1; if($$1>max)max=$$1} \
 	      END{printf "  spread: min=%.2f max=%.2f (%.1f%% of midpoint)\n", \
@@ -80,5 +89,5 @@ clean:
 sfs-support.o: sfs-support.c sfs-disk.h
 sfs-disk.o: sfs-disk.c sfs-api.h sfs-disk.h
 sfs-fsck.o: sfs-fsck.c sfs-disk.h
-test-sfs.o: test-sfs.c sfs-api.h
+test-sfs.o: test-sfs.c sfs-api.h sfs-disk.h
 sfs-baseline-ref.o: sfs-baseline-ref.c sfs-api.h sfs-disk.h

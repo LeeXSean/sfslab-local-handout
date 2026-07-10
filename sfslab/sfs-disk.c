@@ -17,12 +17,10 @@
 // The file system relies on the first block being the "superblock".
 //   This special block contains the information about the disk being
 //   used and can locate the root directory.  Under the current
-//   implementation, there is only one directory, embedded in the
-//   superblock; however, this could be changed by adding support for
-//   a special file type of "directory" and modifying the file lookup
-//   algorithm for opening a file.
+//   implementation, the root directory starts in the superblock and
+//   expands into a chain of directory blocks when needed.
 //
-// A file consists of one or more "disk blocks" which are chunks of 512
+// A file consists of zero or more "disk blocks" which are chunks of 512
 //   bytes.  Each block links to the one before and after it in the file,
 //   which provide 500 bytes of space per allocated block.  The end of
 //   the file is known by both the size of the file and the last block
@@ -34,8 +32,8 @@
 //   open file descriptor tracking the position in the file for that
 //   descriptor.  It links to a separate table that has a single entry
 //   per file, which provides the current size of the file and the
-//   reference count, so that a file could not be deleted while it is
-//   still open.
+//   reference count.  An unlinked file stays here until its final
+//   descriptor is closed.
 //
 // @author Brian Railing (bpr@cs.cmu.edu)
 //
@@ -57,14 +55,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-/** Maximum number of files that can exist.  Since we have not implemented
-    expansion of the root directory, this is equal to the number of directory
-    entries that can fit in a single disk block.  */
-#define FILE_COUNT_LIMIT DIR_ENTRIES_PER_BLOCK
-
-/** Maximum number of open files.  This is intentionally larger
-    than the number of files that can exist; some of the traces
-    open the same file more than once.  */
+/** Maximum number of simultaneously open descriptors.  The expanded
+    directory may contain more files than this. */
 #define OPEN_FILE_LIMIT 32
 
 static_assert(sizeof(sfs_block_file_t) == SFS_BLOCK_SIZE,
@@ -78,8 +70,10 @@ static_assert(sizeof(sfs_filesystem_t) == SFS_BLOCK_SIZE,
 typedef struct sfs_mem_file_t
 {
     uint32_t refCount;
-    int fileEntryIdx;
+    int tableIndex;
+    int unlinked;
     sfs_dir_entry_t *diskFile;
+    sfs_dir_entry_t unlinkedFile;
 } sfs_mem_file_t;
 
 /** This struct corresponds to what CS:APP calls an "open file table" entry.
@@ -95,7 +89,7 @@ typedef struct sfs_mem_filedesc_t
 static_assert(sizeof SFS_DISK_MAGIC == offsetof(sfs_filesystem_t, n_blocks),
               "'type' field of sfs_filesystem_t does not match SFS_DISK_MAGIC");
 
-static sfs_mem_file_t *openFileTable[FILE_COUNT_LIMIT];
+static sfs_mem_file_t *openFileTable[OPEN_FILE_LIMIT];
 static sfs_mem_filedesc_t *openFileDescTable[OPEN_FILE_LIMIT];
 
 //
@@ -198,10 +192,77 @@ static void freeBlocks(block_id first_block)
     superBlock->freelist = first_block;
 }
 
-/** Allocate an open-file-table entry and "file descriptor" referring
-    to an existing file on disk whose directory entry is at index
-    'entryIndex'.  */
-static int addOpenFileEntry(int entryIndex)
+static uint32_t blocksForFileSize(size_t size)
+{
+    if (size == 0)
+        return 0;
+    return (uint32_t)(roundUp(size, BLOCK_DATA_SIZE) / BLOCK_DATA_SIZE);
+}
+
+/** Count the blocks already owned by FILE.  Legacy SFS images represent an
+    empty file with one block; developer images use SFS_EMPTY_FILE_BLOCK. */
+static uint32_t allocatedBlocksForFile(const sfs_dir_entry_t *file)
+{
+    if (file->first_block == SFS_EMPTY_FILE_BLOCK)
+        return 0;
+    assert(file->first_block != 0);
+    return file->size == 0 ? 1 : blocksForFileSize(file->size);
+}
+
+static sfs_block_file_t *fileBlockAt(block_id first, uint32_t index)
+{
+    sfs_block_file_t *block = accessFileBlock(first);
+    while (index-- > 0)
+    {
+        block = accessFileBlock(block->h.next_block);
+        assert(block != NULL);
+    }
+    return block;
+}
+
+static void zeroFileRange(block_id first, size_t begin, size_t end)
+{
+    if (begin == end)
+        return;
+
+    uint32_t index = (uint32_t)(begin / BLOCK_DATA_SIZE);
+    sfs_block_file_t *block = fileBlockAt(first, index);
+    size_t offset = begin % BLOCK_DATA_SIZE;
+    while (begin < end)
+    {
+        size_t chunk = sizeMin(BLOCK_DATA_SIZE - offset, end - begin);
+        memset(block->data + offset, 0, chunk);
+        begin += chunk;
+        if (begin < end)
+        {
+            block = accessFileBlock(block->h.next_block);
+            assert(block != NULL);
+            offset = 0;
+        }
+    }
+}
+
+static block_id blockForPosition(block_id first, size_t position)
+{
+    if (first == 0)
+        return 0;
+    uint32_t index = (uint32_t)(position / BLOCK_DATA_SIZE);
+    if (position != 0 && position % BLOCK_DATA_SIZE == 0)
+        index--;
+    return idOfBlock(&fileBlockAt(first, index)->h);
+}
+
+static sfs_mem_file_t *findOpenFile(const sfs_dir_entry_t *entry)
+{
+    for (int i = 0; i < OPEN_FILE_LIMIT; i++)
+        if (openFileTable[i] != NULL &&
+            openFileTable[i]->diskFile == entry)
+            return openFileTable[i];
+    return NULL;
+}
+
+/** Allocate an open-file-table entry and descriptor for ENTRY. */
+static int addOpenFileEntry(sfs_dir_entry_t *entry)
 {
     sfs_mem_filedesc_t *memDescFile = NULL;
     int fd = -1;
@@ -224,9 +285,19 @@ static int addOpenFileEntry(int entryIndex)
         return -EMFILE;
     }
 
-    sfs_mem_file_t *fileEntry = openFileTable[entryIndex];
+    sfs_mem_file_t *fileEntry = findOpenFile(entry);
     if (fileEntry == NULL)
     {
+        int table_index = -1;
+        for (int i = 0; i < OPEN_FILE_LIMIT; i++)
+        {
+            if (openFileTable[i] == NULL)
+            {
+                table_index = i;
+                break;
+            }
+        }
+        assert(table_index >= 0);
         fileEntry = malloc(sizeof(sfs_mem_file_t));
         if (fileEntry == NULL)
         {
@@ -234,16 +305,19 @@ static int addOpenFileEntry(int entryIndex)
             return -ENOMEM;
         }
 
-        sfs_filesystem_t *superBlock = accessSuperBlock();
-        fileEntry->diskFile = &superBlock->files[entryIndex];
-        fileEntry->fileEntryIdx = entryIndex;
+        fileEntry->diskFile = entry;
+        fileEntry->tableIndex = table_index;
+        fileEntry->unlinked = 0;
         fileEntry->refCount = 0;
-        openFileTable[entryIndex] = fileEntry;
+        openFileTable[table_index] = fileEntry;
     }
 
     fileEntry->refCount += 1;
     memDescFile->fileEntry = fileEntry;
-    memDescFile->startBlock = fileEntry->diskFile->first_block;
+    memDescFile->startBlock =
+        fileEntry->diskFile->first_block == SFS_EMPTY_FILE_BLOCK
+            ? 0
+            : fileEntry->diskFile->first_block;
     memDescFile->currBlock = memDescFile->startBlock;
     memDescFile->currPos = 0;
     openFileDescTable[fd] = memDescFile;
@@ -259,7 +333,7 @@ int sfs_has_open_files(void)
     }
 
     // With no live descriptor entries, no per-file entries should remain.
-    for (int idx = 0; (unsigned long)idx < FILE_COUNT_LIMIT; idx++)
+    for (int idx = 0; idx < OPEN_FILE_LIMIT; idx++)
     {
         assert(openFileTable[idx] == NULL);
     }
@@ -267,40 +341,81 @@ int sfs_has_open_files(void)
     return 0;
 }
 
-/** Create a new file named 'fileName' and return an open-file-table
-    entry for it.  'emptyIndex' is known to be a free slot in the
-    directory on disk.  */
-static int createFile(const char *fileName, int emptyIndex)
+static sfs_block_dir_t *accessDirectoryBlock(block_id id)
 {
-    // Every file must occupy at least one block on disk, even if
-    // it is empty.  This is because we use nonzero 'first_block'
-    // to identify files that do exist.  (Optional puzzle for you:
-    // find a way to avoid this, so that empty files consume only
-    // a directory entry.)
+    sfs_block_hdr_t *header = accessBlock(id);
+    assert(memcmp(header->type, SFS_BLOCK_TYPE_DIR,
+                  sizeof header->type) == 0);
+    return (sfs_block_dir_t *)header;
+}
 
-    block_id startBlock = allocateBlocks(1, SFS_BLOCK_TYPE_FILE);
-    if (startBlock == 0)
-        return -ENOSPC;
+static sfs_dir_entry_t *findDirectoryEntry(const char *name,
+                                           sfs_dir_entry_t **empty_out,
+                                           block_id *last_dir_out)
+{
+    sfs_filesystem_t *super = accessSuperBlock();
+    sfs_dir_entry_t *empty = NULL;
+    for (size_t i = 0; i < DIR_ENTRIES_PER_BLOCK; i++)
+    {
+        sfs_dir_entry_t *entry = &super->files[i];
+        if (entry->first_block != 0 && strcmp(entry->name, name) == 0)
+            return entry;
+        if (empty == NULL && entry->first_block == 0)
+            empty = entry;
+    }
 
-    sfs_filesystem_t *superBlock = accessSuperBlock();
-    sfs_dir_entry_t *sfe = &superBlock->files[emptyIndex];
-    sfe->first_block = startBlock;
-    sfe->size = 0;
+    block_id last = 0;
+    for (block_id id = super->next_rootdir; id != 0;)
+    {
+        sfs_block_dir_t *dir = accessDirectoryBlock(id);
+        last = id;
+        for (size_t i = 0; i < DIR_ENTRIES_PER_BLOCK; i++)
+        {
+            sfs_dir_entry_t *entry = &dir->files[i];
+            if (entry->first_block != 0 && strcmp(entry->name, name) == 0)
+                return entry;
+            if (empty == NULL && entry->first_block == 0)
+                empty = entry;
+        }
+        id = dir->h.next_block;
+    }
+    if (empty_out != NULL)
+        *empty_out = empty;
+    if (last_dir_out != NULL)
+        *last_dir_out = last;
+    return NULL;
+}
 
-    // Overlength names _should_ have been excluded at a higher level.
+static sfs_dir_entry_t *expandDirectory(block_id last_dir)
+{
+    block_id id = allocateBlocks(1, SFS_BLOCK_TYPE_DIR);
+    if (id == 0)
+        return NULL;
+    sfs_block_dir_t *dir = (sfs_block_dir_t *)accessBlock(id);
+    memset((char *)dir + sizeof dir->h, 0, SFS_BLOCK_SIZE - sizeof dir->h);
+    dir->h.prev_block = last_dir;
+    dir->h.next_block = 0;
+    if (last_dir == 0)
+        accessSuperBlock()->next_rootdir = id;
+    else
+        accessDirectoryBlock(last_dir)->h.next_block = id;
+    return &dir->files[0];
+}
+
+/** Create a zero-block empty file in ENTRY and return an open descriptor. */
+static int createFile(const char *fileName, sfs_dir_entry_t *entry)
+{
+    entry->first_block = SFS_EMPTY_FILE_BLOCK;
+    entry->size = 0;
+
     size_t len = strlen(fileName);
     assert(len + 1 <= SFS_FILE_NAME_SIZE_LIMIT);
+    memcpy(entry->name, fileName, len);
+    memset(entry->name + len, '\0', SFS_FILE_NAME_SIZE_LIMIT - len);
 
-    // Copy the name and then clear the rest of the space.
-    memcpy(sfe->name, fileName, len);
-    memset(sfe->name + len, '\0', SFS_FILE_NAME_SIZE_LIMIT - len);
-
-    int fd = addOpenFileEntry(emptyIndex);
+    int fd = addOpenFileEntry(entry);
     if (fd < 0)
-    {
-        sfe->first_block = 0;
-        freeBlocks(startBlock);
-    }
+        memset(entry, 0, sizeof *entry);
     return fd;
 }
 
@@ -324,31 +439,19 @@ int sfs_open(const char *fileName)
     if (getSFSStatus() < 0)
         return -ENOMEDIUM;
 
-    sfs_filesystem_t *superBlock = accessSuperBlock();
-    int fileEntry;
-    int emptyEntry = -1;
-    for (fileEntry = 0; (unsigned long)fileEntry < FILE_COUNT_LIMIT;
-         fileEntry++)
+    sfs_dir_entry_t *empty = NULL;
+    block_id last_dir = 0;
+    sfs_dir_entry_t *entry =
+        findDirectoryEntry(fileName, &empty, &last_dir);
+    if (entry != NULL)
+        return addOpenFileEntry(entry);
+    if (empty == NULL)
     {
-        if (superBlock->files[fileEntry].first_block != 0 &&
-            strcmp(superBlock->files[fileEntry].name, fileName) == 0)
-        {
-            return addOpenFileEntry(fileEntry);
-        }
-        else if (emptyEntry == -1 &&
-                 superBlock->files[fileEntry].first_block == 0)
-        {
-            emptyEntry = fileEntry;
-        }
+        empty = expandDirectory(last_dir);
+        if (empty == NULL)
+            return -ENOSPC;
     }
-
-    // Optional challenge: Allow the super block to be just the first
-    // in a chain of directory blocks, and thus permit more than
-    // FILE_COUNT_LIMIT files to exist.
-    if (emptyEntry == -1)
-        return -ENOSPC;
-
-    return createFile(fileName, emptyEntry);
+    return createFile(fileName, empty);
 }
 
 void sfs_close(int fd)
@@ -366,7 +469,10 @@ void sfs_close(int fd)
     if (fileEntry->refCount > 0)
         return;
 
-    int idx = fileEntry->fileEntryIdx;
+    if (fileEntry->unlinked &&
+        fileEntry->diskFile->first_block != SFS_EMPTY_FILE_BLOCK)
+        freeBlocks(fileEntry->diskFile->first_block);
+    int idx = fileEntry->tableIndex;
     free(fileEntry);
     openFileTable[idx] = NULL;
 }
@@ -391,6 +497,8 @@ ssize_t sfs_read(int fd, char *buf, size_t len)
     size_t totalToRead = sizeMin(fileSize - currPos, len);
 
     size_t toRead = totalToRead;
+    if (toRead == 0)
+        return 0;
 
     // Copy chunks of data from the mapped disk image to the caller's buffer.
     //
@@ -454,17 +562,17 @@ ssize_t sfs_write(int fd, const char *buf, size_t len)
     // either writes all 'len' bytes, or none.
     if (len > SFS_MAX_FILE_SIZE - currPos)
         return -EFBIG;
+    if (len == 0)
+        return 0;
 
-    size_t fileAllocSize = roundUp(fileSize, BLOCK_DATA_SIZE);
+    size_t fileAllocSize =
+        (size_t)allocatedBlocksForFile(tFile->fileEntry->diskFile) *
+        BLOCK_DATA_SIZE;
     size_t endPos = len + currPos;
     size_t toWrite = len;
 
     // If we need to enlarge the file, do so now, and if we can't make
-    // it big enough, fail the whole operation.  Note that empty files
-    // still have one allocated block: files of length [0, 500]
-    // require one block, [501, 1000] require two, etc.  (Optional
-    // challenge: Think of a way to make empty files not require any
-    // allocated blocks.)
+    // it big enough, fail the whole operation.
     block_id firstNewId = 0;
     if (endPos > fileAllocSize)
     {
@@ -480,7 +588,28 @@ ssize_t sfs_write(int fd, const char *buf, size_t len)
 
     // Copy chunks of data from the caller's buffer to the mapped disk image.
     // See comments above the very similar loop in sfs_read() for more detail.
-    sfs_block_file_t *diskBlock = accessFileBlock(tFile->currBlock);
+    sfs_block_file_t *diskBlock;
+    if (tFile->currBlock == 0)
+    {
+        assert(fileSize == 0 && currPos == 0 && firstNewId != 0);
+        diskBlock = accessFileBlock(firstNewId);
+        tFile->fileEntry->diskFile->first_block = firstNewId;
+        for (int i = 0; i < OPEN_FILE_LIMIT; i++)
+        {
+            sfs_mem_filedesc_t *open = openFileDescTable[i];
+            if (open != NULL && open->fileEntry == tFile->fileEntry)
+            {
+                open->startBlock = firstNewId;
+                if (open->currBlock == 0)
+                    open->currBlock = firstNewId;
+            }
+        }
+        firstNewId = 0;
+    }
+    else
+    {
+        diskBlock = accessFileBlock(tFile->currBlock);
+    }
     size_t blockPos = currPos % BLOCK_DATA_SIZE;
     size_t chunkSize =
         sizeMin(roundUp(currPos, BLOCK_DATA_SIZE) - currPos, toWrite);
@@ -526,6 +655,108 @@ ssize_t sfs_write(int fd, const char *buf, size_t len)
     return (ssize_t)len;
 }
 
+ssize_t sfs_fstat(int fd)
+{
+    if (fd < 0 || fd >= OPEN_FILE_LIMIT || openFileDescTable[fd] == NULL)
+        return -EBADF;
+    return (ssize_t)openFileDescTable[fd]->fileEntry->diskFile->size;
+}
+
+int sfs_ftruncate(int fd, size_t length)
+{
+    if (fd < 0 || fd >= OPEN_FILE_LIMIT)
+        return -EBADF;
+
+    sfs_mem_filedesc_t *descriptor = openFileDescTable[fd];
+    if (descriptor == NULL)
+        return -EBADF;
+    if (length > SFS_MAX_FILE_SIZE)
+        return -EFBIG;
+
+    sfs_mem_file_t *file = descriptor->fileEntry;
+    size_t old_size = file->diskFile->size;
+    if (length == old_size)
+        return 0;
+
+    uint32_t old_blocks = allocatedBlocksForFile(file->diskFile);
+    uint32_t new_blocks = blocksForFileSize(length);
+    block_id first = file->diskFile->first_block == SFS_EMPTY_FILE_BLOCK
+                         ? 0
+                         : file->diskFile->first_block;
+
+    if (new_blocks > old_blocks)
+    {
+        uint32_t extra = new_blocks - old_blocks;
+        block_id first_new = allocateBlocks(extra, SFS_BLOCK_TYPE_FILE);
+        if (first_new == 0)
+            return -ENOSPC;
+        if (old_blocks == 0)
+        {
+            first = first_new;
+            file->diskFile->first_block = first_new;
+            for (int i = 0; i < OPEN_FILE_LIMIT; i++)
+            {
+                sfs_mem_filedesc_t *open = openFileDescTable[i];
+                if (open != NULL && open->fileEntry == file)
+                {
+                    open->startBlock = first_new;
+                    open->currBlock = first_new;
+                }
+            }
+        }
+        else
+        {
+            sfs_block_file_t *tail = fileBlockAt(first, old_blocks - 1);
+            sfs_block_file_t *new_head = accessFileBlock(first_new);
+            tail->h.next_block = first_new;
+            new_head->h.prev_block = idOfBlock(&tail->h);
+        }
+    }
+    else if (new_blocks < old_blocks)
+    {
+        if (new_blocks == 0)
+        {
+            freeBlocks(first);
+            first = 0;
+            file->diskFile->first_block = SFS_EMPTY_FILE_BLOCK;
+            for (int i = 0; i < OPEN_FILE_LIMIT; i++)
+                if (openFileDescTable[i] != NULL &&
+                    openFileDescTable[i]->fileEntry == file)
+                    openFileDescTable[i]->startBlock = 0;
+        }
+        else
+        {
+            sfs_block_file_t *tail = fileBlockAt(first, new_blocks - 1);
+            block_id first_free = tail->h.next_block;
+            assert(first_free != 0);
+            freeBlocks(first_free);
+        }
+    }
+
+    if (length > old_size)
+        zeroFileRange(first, old_size, length);
+    else
+        zeroFileRange(first, length,
+                      (size_t)new_blocks * BLOCK_DATA_SIZE);
+    file->diskFile->size = (uint32_t)length;
+
+    if (length < old_size)
+    {
+        for (int i = 0; i < OPEN_FILE_LIMIT; i++)
+        {
+            sfs_mem_filedesc_t *open = openFileDescTable[i];
+            if (open != NULL && open->fileEntry == file &&
+                open->currPos >= length)
+            {
+                if (open->currPos > length)
+                    open->currPos = length;
+                open->currBlock = blockForPosition(first, length);
+            }
+        }
+    }
+    return 0;
+}
+
 ssize_t sfs_getpos(int fd)
 {
     // It's your job as the student to implement this function.
@@ -555,36 +786,23 @@ int sfs_remove(const char *name)
     if (getSFSStatus() < 0)
         return -ENOMEDIUM;
 
-    sfs_filesystem_t *superBlock = accessSuperBlock();
-    for (int fileEntry = 0; (unsigned long)fileEntry < FILE_COUNT_LIMIT;
-         fileEntry++)
-    {
-        if (superBlock->files[fileEntry].first_block != 0 &&
-            strcmp(superBlock->files[fileEntry].name, name) == 0)
-        {
-            // Is this file currently open?
-            if (openFileTable[fileEntry] != NULL)
-            {
-                // The Unix convention is, when you delete a file that's
-                // open, it disappears from its directory, but its contents
-                // survive until everyone has closed it.  SFS is not set up
-                // to handle this, so instead we refuse to delete files
-                // that are open.  Optional challenge for you: Change SFS so
-                // it *can* do what Unix does.
-                return -EBUSY;
-            }
-            block_id firstBlock = superBlock->files[fileEntry].first_block;
-            superBlock->files[fileEntry].first_block = 0;
-            freeBlocks(firstBlock);
-            return 0;
-        }
-    }
+    sfs_dir_entry_t *entry = findDirectoryEntry(name, NULL, NULL);
+    if (entry == NULL)
+        return -ENOENT;
 
-    // If we get here, the file we were asked to delete does not exist.
-    // The Unix convention is to report this as an error.  It would be
-    // equally valid to report success -- we were asked to make the
-    // file not exist, and indeed it doesn't!
-    return -ENOENT;
+    sfs_mem_file_t *open = findOpenFile(entry);
+    if (open != NULL)
+    {
+        open->unlinkedFile = *entry;
+        open->diskFile = &open->unlinkedFile;
+        open->unlinked = 1;
+    }
+    else if (entry->first_block != SFS_EMPTY_FILE_BLOCK)
+    {
+        freeBlocks(entry->first_block);
+    }
+    memset(entry, 0, sizeof *entry);
+    return 0;
 }
 
 int sfs_rename(const char *old_name, const char *new_name)
@@ -618,31 +836,47 @@ int sfs_list(sfs_list_cookie *cookie, char filename_out[],
         return -ENOMEDIUM;
     }
 
-    // The cookie value is just an offset within the localFiles array,
-    // cast to void*.  It could be necessary to change this in order
-    // to make the filesystem thread-safe, and/or to increase the
-    // number of files that can exist.  If you decide to change it,
-    // keep in mind that the "cookie" argument is a pointer _to_ the
-    // cookie value, not the cookie value itself.
+    // The cookie is the next physical directory slot across the superblock
+    // and every extension block.
     uintptr_t next_file_slot = (uintptr_t)*cookie;
-    struct sfs_filesystem_t *superBlock = accessSuperBlock();
-    while (next_file_slot < FILE_COUNT_LIMIT)
+    uintptr_t slot = 0;
+    sfs_filesystem_t *super = accessSuperBlock();
+    for (size_t i = 0; i < DIR_ENTRIES_PER_BLOCK; i++, slot++)
     {
-        sfs_dir_entry_t *e = &superBlock->files[next_file_slot];
-        if (e->first_block)
+        sfs_dir_entry_t *entry = &super->files[i];
+        if (slot >= next_file_slot && entry->first_block != 0)
         {
-            // Found a "live" directory entry.
-            size_t len = strlen(e->name);
+            size_t len = strlen(entry->name);
             if (len + 1 > filename_space)
             {
                 *cookie = NULL;
                 return -ENAMETOOLONG;
             }
-            memcpy(filename_out, e->name, len + 1);
-            *cookie = (void *)(next_file_slot + 1);
+            memcpy(filename_out, entry->name, len + 1);
+            *cookie = (void *)(slot + 1);
             return 0;
         }
-        next_file_slot++;
+    }
+    for (block_id id = super->next_rootdir; id != 0;)
+    {
+        sfs_block_dir_t *dir = accessDirectoryBlock(id);
+        for (size_t i = 0; i < DIR_ENTRIES_PER_BLOCK; i++, slot++)
+        {
+            sfs_dir_entry_t *entry = &dir->files[i];
+            if (slot >= next_file_slot && entry->first_block != 0)
+            {
+                size_t len = strlen(entry->name);
+                if (len + 1 > filename_space)
+                {
+                    *cookie = NULL;
+                    return -ENAMETOOLONG;
+                }
+                memcpy(filename_out, entry->name, len + 1);
+                *cookie = (void *)(slot + 1);
+                return 0;
+            }
+        }
+        id = dir->h.next_block;
     }
 
     // No more files to report.

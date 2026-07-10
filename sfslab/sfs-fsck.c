@@ -15,10 +15,8 @@
     Unlike the Unix 'fsck' utility, this program cannot correct any
     problems it encounters.
 
-    You are encouraged to add additional checks to this program.
-    However, you should not _need_ to make any changes to it, unless
-    you are tackling an optional challenge trace whose comments
-    specifically mention that you will need to modify sfs-fsck.c.  */
+    The developer branch includes the checks needed for zero-block empty files
+    and extended root-directory chains.  */
 
 #include "sfs-disk.h"
 
@@ -40,18 +38,17 @@ static unsigned int verbose = 0;
 /** When nonzero, print a structural dump of the image before checking it. */
 static unsigned int dump_mode = 0;
 
-/** The bytemap is a C-string with one byte per block, indicating what
+/** The block map has one tag per block, indicating what
     we know about the disk image at any point in the process of
     checking.  Its primary purpose is to identify blocks that, after
     tracing all the lists, cannot be reached; it also helps us identify
     invalid list structures (e.g. circular lists and blocks that are
     on more than one list).
 
-    These are the byte codes used in the bytemap.  They have been
-    organized to allow the bytemap to distinguish the lists for as
-    many files as possible.  If you make SFS capable of holding more
-    than 250 files, or more than one directory, you will need to
-    change how the bytemap works.  */
+    Tags are size_t values so an expanded directory is not limited to
+    250 files by the checker.  */
+typedef size_t block_tag_t;
+
 enum
 {
     /** Sentinel: one block past the end of the disk */
@@ -140,7 +137,7 @@ static const char *sfs_block_type_label(const unsigned char *code)
 /** Given a bytemap code, return a human-readable label for it.
     The string returned by this function may be overwritten by the
     next call to this function.  */
-static const char *block_label(unsigned char block_type)
+static const char *block_label(block_tag_t block_type)
 {
     switch (block_type)
     {
@@ -158,13 +155,8 @@ static const char *block_label(unsigned char block_type)
         return "root directory";
     default:
     {   /* case B_file0...: */
-        // 3 chars are sufficient to print any number in [0, 256]
-        static char label[sizeof "file " + 3];
-        // the cast to unsigned char is mathematically unnecessary but
-        // makes it apparent to gcc's printf format checker that
-        // 'label' is big enough to hold the formatted string
-        snprintf(label, sizeof label, "file %hhu",
-                 ((unsigned char)(block_type - B_file0)));
+        static char label[sizeof "file " + 3 * sizeof(size_t)];
+        snprintf(label, sizeof label, "file %zu", block_type - B_file0);
         return label;
     }
     }
@@ -303,8 +295,8 @@ static const sfs_block_hdr_t *get_block(const sfs_filesystem_t *superblock,
     is not NULL, and we reach the end of the main loop, the variable
     N_BLOCKS_OUT points to is set to the number of blocks in the list.  */
 static int check_blocklist(const char *disk, const sfs_filesystem_t *superblock,
-                           unsigned char *bytemap, block_id first_id,
-                           unsigned char list_type, uint32_t *n_blocks_out)
+                           block_tag_t *bytemap, block_id first_id,
+                           block_tag_t list_type, uint32_t *n_blocks_out)
 {
     if (verbose)
     {
@@ -429,7 +421,7 @@ static int check_blocklist(const char *disk, const sfs_filesystem_t *superblock,
     Does *not* validate the directory.  */
 static int check_superblock(const char *disk,
                             const sfs_filesystem_t *superblock,
-                            size_t image_size, unsigned char **bytemap_out)
+                            size_t image_size, block_tag_t **bytemap_out)
 {
     if (memcmp(superblock->magic, SFS_DISK_MAGIC, sizeof superblock->magic))
     {
@@ -446,15 +438,17 @@ static int check_superblock(const char *disk,
         return -1;
     }
 
-    unsigned char *bytemap = malloc((size_t)superblock->n_blocks + 1);
+    size_t map_entries = (size_t)superblock->n_blocks + 1;
+    block_tag_t *bytemap = malloc(map_entries * sizeof *bytemap);
     if (!bytemap)
     {
         perror("bytemap");
         return -1;
     }
     bytemap[0] = B_super;
-    memset(bytemap + 1, B_unvisited, superblock->n_blocks - 1);
-    bytemap[superblock->n_blocks] = '\0';
+    for (size_t i = 1; i < superblock->n_blocks; i++)
+        bytemap[i] = B_unvisited;
+    bytemap[superblock->n_blocks] = B_end_of_disk;
 
     if (check_blocklist(disk, superblock, bytemap, superblock->freelist, B_free,
                         NULL))
@@ -473,18 +467,16 @@ static int check_superblock(const char *disk,
     return 0;
 }
 
-/** Validate one block's worth of SFS directory entries.
-    You will need to change this function if you decide to change the
-    rule for when a directory entry is in use (for example, in order
-    to make an empty file not allocate any blocks).  */
+/** Validate one block's worth of SFS directory entries, including both the
+    original one-block and developer zero-block empty-file encodings. */
 static int check_directory_entries(const char *disk,
                                    const sfs_filesystem_t *superblock,
                                    const sfs_dir_entry_t *files,
-                                   unsigned char *bytemap,
-                                   unsigned char *file_tag_p)
+                                   block_tag_t *bytemap,
+                                   block_tag_t *file_tag_p)
 {
     int status = 0;
-    unsigned char file_tag = *file_tag_p;
+    block_tag_t file_tag = *file_tag_p;
 
     for (size_t i = 0; i < DIR_ENTRIES_PER_BLOCK; i++)
     {
@@ -555,25 +547,32 @@ static int check_directory_entries(const char *disk,
         }
         status |= name_err;
 
-        /* File ownership tags occupy one byte.  Once all 250 tags have been
-           used, keep validating names but do not feed a wrapped control tag
-           to check_blocklist, which would abort on malformed input. */
-        if (file_tag < B_file0)
-        {
-            status = 1;
-            continue;
-        }
-
         // ... and the size should agree with the number of allocated
         // blocks, assuming the allocation list is valid.
         uint32_t nblocks = 0;
-        int list_err =
-            check_blocklist(disk, superblock, bytemap, files[i].first_block,
-                            file_tag, &nblocks);
+        int list_err = 0;
+        if (files[i].first_block == SFS_EMPTY_FILE_BLOCK)
+        {
+            if (files[i].size != 0)
+            {
+                fprintf(stderr,
+                        "%s: error: dir entry %zu: zero-block sentinel used "
+                        "for nonempty file of size %u\n",
+                        disk, i, files[i].size);
+                list_err = 1;
+            }
+        }
+        else
+        {
+            list_err = check_blocklist(disk, superblock, bytemap,
+                                       files[i].first_block, file_tag,
+                                       &nblocks);
+        }
         status |= list_err;
         if (!list_err)
         {
-            uint32_t exp_nblocks = 1;
+            uint32_t exp_nblocks =
+                files[i].first_block == SFS_EMPTY_FILE_BLOCK ? 0 : 1;
             if (files[i].size)
             {
                 exp_nblocks = (uint32_t)(((size_t)files[i].size +
@@ -590,14 +589,17 @@ static int check_directory_entries(const char *disk,
             }
         }
 
-        file_tag++;
-        if (file_tag == 0)
+        if (file_tag == SIZE_MAX)
         {
             fprintf(stderr,
                     "%s: internal error: out of file tags!\n"
                     "    Contact course staff for assistance.\n",
                     disk);
             status = 1;
+        }
+        else
+        {
+            file_tag++;
         }
     }
 
@@ -606,14 +608,12 @@ static int check_directory_entries(const char *disk,
 }
 
 /** Validate an SFS root directory and the allocation lists for all
-    the files it describes.  This function can handle a root directory
-    that occupies more than one block on disk, even though that's left
-    as an optional exercise for students.  */
+    the files it describes, including developer-branch extension blocks. */
 static int check_root_directory(const char *disk,
                                 const sfs_filesystem_t *superblock,
-                                unsigned char *bytemap)
+                                block_tag_t *bytemap)
 {
-    unsigned char file_tag = B_file0;
+    block_tag_t file_tag = B_file0;
     int status;
 
     if (verbose)
@@ -650,7 +650,7 @@ static int check_root_directory(const char *disk,
     at all, i.e. they aren't reachable via any of the lists. */
 static int check_for_lost_blocks(const char *disk,
                                  const sfs_filesystem_t *superblock,
-                                 const unsigned char *bytemap)
+                                 const block_tag_t *bytemap)
 {
     int status = 0;
     if (verbose)
@@ -658,12 +658,10 @@ static int check_for_lost_blocks(const char *disk,
         fprintf(stderr, "%s: info: checking for lost blocks\n", disk);
     }
 
-    unsigned char *c;
-    for (c = (unsigned char *)strchr((const char *)bytemap, B_unvisited); c;
-         c = (unsigned char *)strchr((const char *)(c + 1), B_unvisited))
+    for (block_id i = 1; i < superblock->n_blocks; i++)
     {
-        block_id i = (block_id)(c - bytemap);
-        assert(i != 0);
+        if (bytemap[i] != B_unvisited)
+            continue;
         const sfs_block_hdr_t *h = get_block(superblock, i);
         const char *label = sfs_block_type_label(h->type);
         if (label)
@@ -763,8 +761,11 @@ static void dump_dir_entries(const sfs_filesystem_t *superblock,
                name_len == SFS_FILE_NAME_SIZE_LIMIT ? " [!name unterminated]"
                                                     : "",
                files[i].size);
-        dump_chain(superblock, limit_blocks, files[i].first_block,
-                   SFS_BLOCK_TYPE_FILE);
+        if (files[i].first_block == SFS_EMPTY_FILE_BLOCK)
+            printf("blocks: none  (zero-block empty file)\n");
+        else
+            dump_chain(superblock, limit_blocks, files[i].first_block,
+                       SFS_BLOCK_TYPE_FILE);
     }
 }
 
@@ -925,7 +926,7 @@ int main(int argc, char **argv)
         fflush(stdout);
     }
 
-    unsigned char *bytemap;
+    block_tag_t *bytemap;
     if (check_superblock(disk, superblock, imagesize, &bytemap))
     {
         munmap(superblock, imagesize);

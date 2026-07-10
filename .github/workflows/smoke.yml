@@ -18,6 +18,9 @@ jobs:
           cd sfslab
           ./test-sfs -q && exit 1 || test $? -eq 1
 
+      - name: Run developer extensions
+        run: make developer-test x-traces
+
       - name: Exercise performance baseline and self-checks
         run: make -C sfslab baseline BASELINE_RUNS=3
 

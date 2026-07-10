@@ -14,6 +14,14 @@ all:
 test:
 	$(MAKE) -C $(HANDOUT) test
 
+.PHONY: developer-test
+developer-test:
+	$(MAKE) -C $(HANDOUT) developer-test
+
+.PHONY: x-traces
+x-traces:
+	$(MAKE) -C $(HANDOUT) x-traces
+
 .PHONY: clean
 clean:
 	$(MAKE) -C $(HANDOUT) clean
