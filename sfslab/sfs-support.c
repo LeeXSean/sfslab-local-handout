@@ -98,6 +98,9 @@ int getSFSStatus(void)
 
 int sfs_format(const char *diskName, size_t diskSize)
 {
+    if (diskBlocks != NULL)
+        return -EBUSY;
+
     // Since we mmap the disk image, its size must be a multiple of
     // the system page size, even though the format only requires it to
     // be a multiple of SFS_BLOCK_SIZE.
@@ -109,8 +112,6 @@ int sfs_format(const char *diskName, size_t diskSize)
         return -EINVAL;
     if (diskSize > SFS_MAX_DISK_SIZE)
         return -EFBIG;
-    if (diskBlocks != NULL)
-        return -EBUSY;
 
     int diskfd = open(diskName, O_RDWR | O_CREAT | O_TRUNC, DEFFILEMODE);
     if (diskfd < 0)
@@ -177,8 +178,7 @@ int sfs_mount(const char *diskName)
         return err;
     }
 
-    // Block numbers are 32-bit, so the biggest supported filesystem
-    // is 2**32 * SFS_BLOCK_SIZE bytes.
+    // The superblock's 32-bit block count bounds the image size.
     if (diskst.st_size > (off_t)SFS_MAX_DISK_SIZE)
     {
         close(diskfd);
@@ -198,22 +198,25 @@ int sfs_mount(const char *diskName)
         return -EINVAL;
     }
 
-    char magic[sizeof SFS_DISK_MAGIC];
-    ssize_t nread = pread(diskfd, magic, sizeof magic, 0);
+    sfs_filesystem_t super;
+    ssize_t nread = pread(diskfd, &super, sizeof super, 0);
     if (nread < 0)
     {
         int err = -errno;
         close(diskfd);
         return err;
     }
-    if (nread != sizeof magic || memcmp(magic, SFS_DISK_MAGIC, sizeof magic))
+    if (nread != (ssize_t)sizeof super ||
+        memcmp(super.magic, SFS_DISK_MAGIC, sizeof super.magic) != 0 ||
+        (size_t)super.n_blocks * SFS_BLOCK_SIZE != (size_t)diskst.st_size)
     {
         close(diskfd);
         return -EINVAL;
     }
 
-    void *mapping = mmap(NULL, (size_t)diskst.st_size, PROT_READ | PROT_WRITE,
-                         MAP_SHARED, diskfd, 0);
+    size_t imageSize = (size_t)diskst.st_size;
+    void *mapping = mmap(NULL, imageSize, PROT_READ | PROT_WRITE, MAP_SHARED,
+                         diskfd, 0);
     if (mapping == MAP_FAILED)
     {
         int err = -errno;
@@ -222,7 +225,7 @@ int sfs_mount(const char *diskName)
     }
     close(diskfd);
     diskBlocks = mapping;
-    diskSizeInBytes = (size_t)diskst.st_size;
+    diskSizeInBytes = imageSize;
     return 0;
 }
 

@@ -48,10 +48,10 @@
     "not in use", things like that.  */
 typedef uint32_t block_id;
 
-/** Because block IDs are 32 bits long, the maximum size of an SFS
-    disk image is 2**32 * SFS_BLOCK_SIZE bytes.  We presume that
-    size_t and off_t can both hold this number.  */
-#define SFS_MAX_DISK_SIZE ((((size_t)UINT32_MAX) + 1) * SFS_BLOCK_SIZE)
+/** The superblock stores the number of blocks in a uint32_t, so the largest
+    representable image contains UINT32_MAX blocks.  We presume that size_t
+    and off_t can both hold this number.  */
+#define SFS_MAX_DISK_SIZE ((size_t)UINT32_MAX * SFS_BLOCK_SIZE)
 
 /** The maximum size of a single file in SFS is capped by the 32-bit
     'size' field in a sfs_dir_entry_t.  */

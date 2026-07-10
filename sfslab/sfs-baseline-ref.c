@@ -141,15 +141,13 @@ static block_id allocateBlocks(uint32_t n_blocks, const char *type)
     block_id first_alloc_id = super->freelist;
     sfs_block_hdr_t *first_alloc_blk = accessFreeBlock(first_alloc_id);
 
-    block_id last_alloc_id = first_alloc_id;
     sfs_block_hdr_t *last_alloc_blk = first_alloc_blk;
 
     for (uint32_t i = 1; i < n_blocks; i++)
     {
         if (last_alloc_blk->next_block == 0)
             return 0; // not enough free blocks available
-        last_alloc_id = last_alloc_blk->next_block;
-        last_alloc_blk = accessFreeBlock(last_alloc_id);
+        last_alloc_blk = accessFreeBlock(last_alloc_blk->next_block);
     }
 
     // At this point we know that we have n_blocks free blocks available.
@@ -311,7 +309,13 @@ static int createFile(const char *fileName, int emptyIndex)
     memcpy(sfe->name, fileName, len);
     memset(sfe->name + len, '\0', SFS_FILE_NAME_SIZE_LIMIT - len);
 
-    return addOpenFileEntry(emptyIndex);
+    int fd = addOpenFileEntry(emptyIndex);
+    if (fd < 0)
+    {
+        sfe->first_block = 0;
+        freeBlocks(startBlock);
+    }
+    return fd;
 }
 
 //
@@ -323,6 +327,11 @@ int sfs_open(const char *fileName)
 {
     BASELINE_LOCK();
     int rv;
+
+    if (fileName[0] == '\0') {
+        rv = -EINVAL;
+        goto out;
+    }
 
     // Can only have 23 characters, because the string on disk is NUL
     // terminated.
@@ -497,6 +506,11 @@ ssize_t sfs_write(int fd, const char *buf, size_t len)
     // This implementation does not do a partial write if there is
     // insufficient space on disk for the complete write; it always
     // either writes all 'len' bytes, or none.
+    if (len > SFS_MAX_FILE_SIZE - currPos) {
+        rv = -EFBIG;
+        goto out;
+    }
+
     size_t fileAllocSize = roundUp(fileSize, BLOCK_DATA_SIZE);
     size_t endPos = len + currPos;
     size_t toWrite = len;
@@ -511,11 +525,6 @@ ssize_t sfs_write(int fd, const char *buf, size_t len)
     if (endPos > fileAllocSize)
     {
         size_t fileNewAllocSize = roundUp(endPos, BLOCK_DATA_SIZE);
-        if (fileNewAllocSize > SFS_MAX_FILE_SIZE) {
-            rv = -EFBIG;
-            goto out;
-        }
-
         uint32_t addlBlocks =
             (uint32_t)((fileNewAllocSize - fileAllocSize) / BLOCK_DATA_SIZE);
         assert(addlBlocks >= 1);
@@ -569,7 +578,7 @@ ssize_t sfs_write(int fd, const char *buf, size_t len)
     tFile->currPos = endPos;
     if (endPos > fileSize)
     {
-        assert(endPos < SFS_MAX_FILE_SIZE);
+        assert(endPos <= SFS_MAX_FILE_SIZE);
         tFile->fileEntry->diskFile->size = (uint32_t)endPos;
     }
     rv = (ssize_t)len;
@@ -600,6 +609,11 @@ int sfs_remove(const char *name)
 {
     BASELINE_LOCK();
     int rv;
+
+    if (name[0] == '\0') {
+        rv = -EINVAL;
+        goto out;
+    }
 
     // Can only have 23 characters, because the string on disk is NUL
     // terminated.
@@ -655,6 +669,10 @@ out:
 int sfs_rename(const char *old_name, const char *new_name)
 {
     BASELINE_LOCK();
+    if (old_name[0] == '\0' || new_name[0] == '\0') {
+        BASELINE_UNLOCK();
+        return -EINVAL;
+    }
     // It's your job as the student to implement this function.
     // See sfs-disk.h for the specification.
     BASELINE_UNLOCK();

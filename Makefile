@@ -3,6 +3,8 @@
 HANDOUT = sfslab
 DIST = sfslab-handout.tar
 DIST_MTIME = 2024-01-01 00:00Z
+HANDOUT_FILES = .clang-format Makefile README sfs-api.h sfs-baseline-ref.c \
+	sfs-disk.c sfs-disk.h sfs-fsck.c sfs-support.c test-sfs.c
 
 .PHONY: all
 all:
@@ -32,7 +34,7 @@ dist:
 	@tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/sfslab-dist.XXXXXX"); \
 	trap 'rm -rf "$$tmp"' EXIT HUP INT TERM; \
 	mkdir "$$tmp/$(HANDOUT)"; \
-	cp -R "$(HANDOUT)/." "$$tmp/$(HANDOUT)/"; \
+	cp $(addprefix $(HANDOUT)/,$(HANDOUT_FILES)) "$$tmp/$(HANDOUT)/"; \
 	cp sfslab.pdf "$$tmp/"; \
 	find "$$tmp" -type d -exec chmod 755 {} +; \
 	find "$$tmp" -type f -exec chmod 644 {} +; \

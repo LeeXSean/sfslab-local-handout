@@ -317,7 +317,9 @@ Unmounting fails with
 if any files are open.
 .LB "\f(CRsfs_open(fileName)\fP"
 Open a file, creating it if necessary; returns a small nonnegative
-\(lqfile descriptor\(rq usable only with these routines.
+\(lqfile descriptor\(rq usable only with these routines.  Empty names return
+.CW \-EINVAL ;
+failed creates leave no directory entry or allocated block.
 .LB "\f(CRsfs_close(fd)\fP"
 Close a descriptor.  Never fails.
 .LB "\f(CRsfs_read(fd, buf, len)\fP / \f(CRsfs_write(fd, buf, len)\fP"
@@ -382,6 +384,8 @@ in which a concurrent thread can observe
 .CW new_name
 not existing.  For the single-threaded version this is straightforward;
 once you add locking, keeping this promise is part of the design work.
+Renaming an existing file to itself is a no-op; empty names return
+.CW \-EINVAL .
 .EL
 .SEC "Making the File System Concurrent"
 .PP
@@ -435,9 +439,9 @@ A: feature traces (A00\-A04);5;T{
 format/mount, open/close/read/write, getpos, seek, rename
 T}
 B: sequential traces (B00\-B03);4;T{
-remove/list and slot reuse, multi-block seek, overwrite-after-seek data
-integrity, error codes and edge cases (including full-disk
-\f(CR\-ENOSPC\fP and descriptor-table \f(CR\-EMFILE\fP), rename/list
+remove/list and slot reuse, multi-block seek, overwrite and cross-block append
+integrity, error codes and edges (full-disk \f(CR\-ENOSPC\fP, fd-table
+\f(CR\-EMFILE\fP rollback, empty names, oversized writes), rename/list
 interactions
 T}
 C: concurrent traces (C00\-C02);3;T{
@@ -503,19 +507,20 @@ rerun on a TSan-capable machine before trusting the concurrency score.
 .SUB "Performance (10 points)"
 .PP
 The performance benchmark runs only after correctness is 12/12.  It starts
-8 threads, each working on its own file.  A thread performs 2000
+8 threads, each working on its own file.  A thread performs 16000
 .I sessions ;
 one session is one
 .CW sfs_open ,
-then 10 rounds of write/seek/getpos/read, then one
+then 10 rounds of write/getpos/seek/read, then one
 .CW sfs_close
-\(em 672,000 API calls per run in total.  Timing starts at a barrier after
-all threads exist, so thread startup is excluded; the benchmark is sampled
+\(em 5,376,000 API calls per run in total.  Timing starts immediately before
+a start gate releases the already-created threads, so thread startup is
+excluded; the benchmark is sampled
 5 times and the median ops/sec is scored.
 .PP
 The workload validates its own results as it runs: every return value is
-checked against the position the descriptor must be at, and each session's
-first read is compared against the bytes just written.  If any check
+checked against the position the descriptor must be at, and every round seeks
+back and compares the exact bytes it just wrote.  If any check
 fails, the performance score is 0 \(em an implementation that is fast but
 wrong on the benchmark path earns nothing.
 .PP
@@ -548,10 +553,9 @@ so full marks stay reachable on small CPUs.
 .PP
 If
 .CW .perf_baseline
-is missing, or was calibrated with a different benchmark version (the file
-carries a
-.CW WORKLOAD=
-tag), the driver falls back to absolute throughput
+is missing, uses another workload version, or records a different
+.CW SFS_DISK_DIR
+than the scored run, the driver falls back to absolute throughput
 .I "capped at 5/10"
 and tells you to re-run
 .CW "make baseline" .
@@ -586,7 +590,8 @@ per trace are printed).  The exit status is the correctness gate: 0 once
 all twelve correctness traces pass, 1 otherwise.  The performance score
 never affects the exit status; read it from the scoreboard.
 .PP
-When a trace fails, the driver saves a copy of the trace's surviving disk
+In a non-quiet run, when a trace fails, the driver saves a copy of its
+surviving disk
 image(s) under
 .CW fail_<trace>_<image>.img
 and prints the path, so you can inspect the exact corrupted state instead
@@ -642,7 +647,7 @@ Replace
 .CW 2
 with whatever seed the driver reported.  The same seed reproduces the same
 schedule perturbation, so a failure found under fuzz is replayable.  The
-scored run never fuzzes; only the TSan sweep and explicit
+normal correctness pass never fuzzes; only the TSan sweep and explicit
 .CW \-\-sched-fuzz
 invocations do.
 .SUB "Calibrating and reading the performance score"
@@ -679,8 +684,8 @@ The chosen directory is recorded in
 .CW .perf_baseline ;
 if the calibration and the scored run disagree about
 .CW SFS_DISK_DIR ,
-the driver prints a loud warning, because the two measurements would be of
-different file systems.  Moving the whole project into the Linux-native
+the driver ignores the ratio and caps the absolute score at 5/10 because the
+measurements use different file systems.  Moving the whole project into the Linux-native
 file system (e.g. under
 .CW "\(rs\(rswsl$\(rsUbuntu\(rshome" )
 is the most robust fix.
@@ -749,11 +754,4 @@ specified in
 .CW sfs-api.h
 and is deliberately different from
 .CW lseek (2).
-.LB "Does \f(CRsfs_rename\fP need to be atomic?"
-Yes.  If
-.CW new_name
-already exists, the replacement must leave no window in which a concurrent
-thread can observe the name missing.  For the single-threaded milestone
-this falls out naturally; once you add locking, make sure no code path
-briefly deletes the destination before the source takes its place.
 .EL

@@ -387,6 +387,10 @@ static int trace_A00(void)
     int r = sfs_format(DISK_NAME, disk_size());
     CHECK(r == 0, "sfs_format returned %d", r);
 
+    r = sfs_format(DISK_NAME, 0);
+    CHECK(r == -EBUSY,
+          "sfs_format while mounted should be -EBUSY, got %d", r);
+
     r = sfs_unmount();
     CHECK(r == 0, "sfs_unmount returned %d", r);
     if (r == 0)
@@ -399,6 +403,27 @@ static int trace_A00(void)
     CHECK(r == 0, "sfs_unmount returned %d", r);
     if (r == 0)
         check_disk_consistency(DISK_NAME);
+
+    /* Mount must reject a superblock whose recorded size disagrees with the
+       mapped image, rather than trusting it until a later block access. */
+    int raw = open(DISK_NAME, O_RDWR);
+    CHECK(raw >= 0, "open raw disk image returned %d", raw);
+    if (raw >= 0)
+    {
+        uint32_t bad_nblocks = 0;
+        ssize_t nw = pwrite(raw, &bad_nblocks, sizeof bad_nblocks, 8);
+        CHECK(nw == (ssize_t)sizeof bad_nblocks,
+              "failed to corrupt n_blocks for mount validation");
+        close(raw);
+    }
+    r = sfs_mount(DISK_NAME);
+    CHECK(r == -EINVAL,
+          "mount with mismatched n_blocks should be -EINVAL, got %d", r);
+
+    r = sfs_format(DISK_NAME, disk_size());
+    CHECK(r == 0, "sfs_format after rejected mount returned %d", r);
+    if (r == 0)
+        unmount_and_check(DISK_NAME);
     return trace_ok;
 }
 
@@ -422,7 +447,8 @@ static int trace_A01(void)
     char buf[64] = {0};
     ssize_t nr = sfs_read(fd, buf, sizeof buf);
     CHECK(nr == (ssize_t)strlen(msg), "sfs_read returned %zd", nr);
-    CHECK(memcmp(buf, msg, (size_t)nr) == 0, "data mismatch");
+    if (nr == (ssize_t)strlen(msg))
+        CHECK(memcmp(buf, msg, strlen(msg)) == 0, "data mismatch");
     sfs_close(fd);
 
     unmount_and_check(DISK_NAME);
@@ -575,12 +601,13 @@ static int trace_B00(void)
     sfs_list_cookie cookie = NULL;
     char name[SFS_FILE_NAME_SIZE_LIMIT];
     int count = 0;
+    int list_status;
     int saw_del = 0;
     int saw_file1 = 0;
     int saw_file2 = 0;
     int saw_file3 = 0;
     int saw_file4 = 0;
-    while (sfs_list(&cookie, name, sizeof name) == 0)
+    while ((list_status = sfs_list(&cookie, name, sizeof name)) == 0)
     {
         count++;
         if (strcmp(name, "del.txt") == 0) saw_del = 1;
@@ -590,6 +617,8 @@ static int trace_B00(void)
         if (strcmp(name, "file4") == 0) saw_file4 = 1;
     }
     CHECK(count == 3, "expected 3 files, got %d", count);
+    CHECK(list_status == 1, "list should end with status 1, got %d",
+          list_status);
     CHECK(!saw_del && !saw_file2,
           "removed names should not appear in list");
     CHECK(saw_file1 && saw_file3 && saw_file4,
@@ -757,6 +786,10 @@ static int trace_B02(void)
           "write(32) should return -EBADF");
     sfs_close(32);
 
+    CHECK(sfs_open("") == -EINVAL, "open(empty name) should return -EINVAL");
+    CHECK(sfs_remove("") == -EINVAL,
+          "remove(empty name) should return -EINVAL");
+
     /* name too long */
     char longname[SFS_FILE_NAME_SIZE_LIMIT + 8];
     memset(longname, 'x', sizeof longname - 1);
@@ -827,6 +860,28 @@ static int trace_B02(void)
           "read after seek to 0: data mismatch");
     sfs_close(fd);
 
+    /* Consecutive append across a block boundary. */
+    fd = sfs_open("append.txt");
+    CHECK(fd >= 0, "open append.txt returned %d", fd);
+    CHECK(sfs_write(fd, fill, 499) == 499, "initial append write failed");
+    CHECK(sfs_write(fd, "XYZ", 3) == 3, "second append write failed");
+    CHECK(sfs_seek(fd, -502) == 0, "seek to start of append.txt failed");
+    char append_buf[502];
+    nr = sfs_read(fd, append_buf, sizeof append_buf);
+    CHECK(nr == (ssize_t)sizeof append_buf &&
+              memcmp(append_buf, fill, 499) == 0 &&
+              memcmp(append_buf + 499, "XYZ", 3) == 0,
+          "consecutive cross-block append data mismatch");
+    sfs_close(fd);
+
+    fd = sfs_open("oversize.txt");
+    CHECK(fd >= 0, "open oversize.txt returned %d", fd);
+    CHECK(sfs_write(fd, "x", SIZE_MAX) == -EFBIG,
+          "write larger than SFS_MAX_FILE_SIZE should return -EFBIG");
+    CHECK(sfs_getpos(fd) == 0,
+          "failed oversized write should not advance the position");
+    sfs_close(fd);
+
     /* interior overwrite after seeking backward: the neighbouring bytes
        must be preserved and the size must not grow */
     fd = sfs_open("overwrite.txt");
@@ -873,6 +928,17 @@ static int trace_B02(void)
     CHECK(n_open == FD_PROBE_MAX || probe_err == -EMFILE,
           "running out of descriptors should report -EMFILE, got %d",
           probe_err);
+    if (probe_err == -EMFILE)
+    {
+        int ghost = sfs_open("ghost");
+        CHECK(ghost == -EMFILE,
+              "new-file open with a full fd table should be -EMFILE, got %d",
+              ghost);
+        if (ghost >= 0)
+            sfs_close(ghost);
+        CHECK(sfs_remove("ghost") == -ENOENT,
+              "failed open must not leave a directory entry or block");
+    }
     for (int i = 0; i < n_open; i++)
         sfs_close(fds[i]);
     r = sfs_remove("many");
@@ -948,7 +1014,7 @@ static int trace_B03(void)
     int saw_src = 0;
     int saw_dst = 0;
     int saw_keep = 0;
-    while (sfs_list(&cookie, name, sizeof name) == 0)
+    while ((r = sfs_list(&cookie, name, sizeof name)) == 0)
     {
         count++;
         if (strcmp(name, "src") == 0) saw_src = 1;
@@ -957,6 +1023,7 @@ static int trace_B03(void)
     }
     CHECK(count == 2, "expected 2 files after overwrite rename, got %d",
           count);
+    CHECK(r == 1, "list should end with status 1, got %d", r);
     CHECK(!saw_src, "src should not remain after rename");
     CHECK(saw_dst && saw_keep, "dst and keep should be listed");
 
@@ -967,6 +1034,9 @@ static int trace_B03(void)
     CHECK(nr == 8 && memcmp(buf, "SRC-DATA", 8) == 0,
           "dst should contain renamed src data with updated size");
     sfs_close(fd);
+
+    CHECK(sfs_rename("dst", "dst") == 0,
+          "renaming a file to itself should succeed without changing it");
 
     fd = sfs_open("reuse");
     CHECK(fd >= 0, "open reuse after overwrite rename returned %d", fd);
@@ -979,7 +1049,7 @@ static int trace_B03(void)
     saw_dst = 0;
     saw_keep = 0;
     int saw_reuse = 0;
-    while (sfs_list(&cookie, name, sizeof name) == 0)
+    while ((r = sfs_list(&cookie, name, sizeof name)) == 0)
     {
         count++;
         if (strcmp(name, "src") == 0) saw_src = 1;
@@ -989,6 +1059,7 @@ static int trace_B03(void)
     }
     CHECK(count == 3, "expected 3 files after rename-slot reuse, got %d",
           count);
+    CHECK(r == 1, "list should end with status 1, got %d", r);
     CHECK(!saw_src, "src should not reappear after slot reuse");
     CHECK(saw_dst && saw_keep && saw_reuse,
           "dst, keep, and reuse should be listed");
@@ -1000,6 +1071,10 @@ static int trace_B03(void)
           "remove(longname) should return -ENAMETOOLONG");
     CHECK(sfs_rename("dst", longname) == -ENAMETOOLONG,
           "rename to longname should return -ENAMETOOLONG");
+    CHECK(sfs_rename("", "dst") == -EINVAL,
+          "rename from an empty name should return -EINVAL");
+    CHECK(sfs_rename("dst", "") == -EINVAL,
+          "rename to an empty name should return -EINVAL");
 
     cookie = NULL;
     CHECK(sfs_list(&cookie, name, 0) == -EINVAL,
@@ -1149,6 +1224,13 @@ static int c_sfs_rename(const char *old_name, const char *new_name)
     return ret;
 }
 
+static int start_thread(pthread_t *thread, void *(*fn)(void *), void *arg)
+{
+    int err = pthread_create(thread, NULL, fn, arg);
+    CHECK(err == 0, "pthread_create failed: %s", strerror(err));
+    return err == 0;
+}
+
 static void *thread_write_own_file(void *arg)
 {
     int id = *(int *)arg;
@@ -1161,7 +1243,11 @@ static void *thread_write_own_file(void *arg)
 
     char data[64];
     int len = snprintf(data, sizeof data, "thread-%d-payload", id);
-    c_sfs_write(fd, data, (size_t)len);
+    if (c_sfs_write(fd, data, (size_t)len) != (ssize_t)len)
+    {
+        c_sfs_close(fd);
+        return (void *)(intptr_t)-1;
+    }
     c_sfs_close(fd);
 
     fd = c_sfs_open(fname);
@@ -1185,29 +1271,36 @@ static int trace_C00(void)
 
     pthread_t threads[NUM_THREADS];
     int ids[NUM_THREADS];
+    int nthreads = 0;
     for (int i = 0; i < NUM_THREADS; i++)
     {
         ids[i] = i;
-        pthread_create(&threads[i], NULL, thread_write_own_file, &ids[i]);
+        if (!start_thread(&threads[i], thread_write_own_file, &ids[i]))
+            break;
+        nthreads++;
     }
 
     int ok = 1;
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < nthreads; i++)
     {
         void *ret;
         pthread_join(threads[i], &ret);
         if (ret != NULL)
             ok = 0;
     }
-    CHECK(ok, "concurrent writes to separate files: data corruption");
+    CHECK(ok && nthreads == NUM_THREADS,
+          "concurrent writes to separate files failed");
 
     sfs_list_cookie cookie = NULL;
     char name[SFS_FILE_NAME_SIZE_LIMIT];
     int count = 0;
-    while (c_sfs_list(&cookie, name, sizeof name) == 0)
+    int list_status;
+    while ((list_status = c_sfs_list(&cookie, name, sizeof name)) == 0)
         count++;
     CHECK(count == NUM_THREADS, "expected %d files, got %d", NUM_THREADS,
           count);
+    CHECK(list_status == 1, "list should end with status 1, got %d",
+          list_status);
 
     unmount_and_check(CONC_DISK_C00);
     unlink(CONC_DISK_C00);
@@ -1240,18 +1333,24 @@ static int trace_C01(void)
     c_sfs_close(fd);
 
     pthread_t threads[NUM_THREADS];
+    int nthreads = 0;
     for (int i = 0; i < NUM_THREADS; i++)
-        pthread_create(&threads[i], NULL, thread_read_shared, NULL);
+    {
+        if (!start_thread(&threads[i], thread_read_shared, NULL))
+            break;
+        nthreads++;
+    }
 
     int ok = 1;
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < nthreads; i++)
     {
         void *ret;
         pthread_join(threads[i], &ret);
         if (ret != NULL)
             ok = 0;
     }
-    CHECK(ok, "concurrent reads of same file failed");
+    CHECK(ok && nthreads == NUM_THREADS,
+          "concurrent reads of same file failed");
 
     unmount_and_check(CONC_DISK_C01);
     unlink(CONC_DISK_C01);
@@ -1277,7 +1376,11 @@ static void *thread_rw_mix(void *arg)
             return (void *)(intptr_t)-1;
         char data[32];
         int len = snprintf(data, sizeof data, "data-%d", a->id);
-        c_sfs_write(fd, data, (size_t)len);
+        if (c_sfs_write(fd, data, (size_t)len) != (ssize_t)len)
+        {
+            c_sfs_close(fd);
+            return (void *)(intptr_t)-1;
+        }
         c_sfs_close(fd);
     }
     else
@@ -1286,8 +1389,10 @@ static void *thread_rw_mix(void *arg)
         if (fd < 0)
             return (void *)(intptr_t)-1;
         char buf[32];
-        c_sfs_read(fd, buf, sizeof buf);
+        ssize_t nr = c_sfs_read(fd, buf, sizeof buf);
         c_sfs_close(fd);
+        if (nr != 0)
+            return (void *)(intptr_t)-1;
     }
     return NULL;
 }
@@ -1297,8 +1402,9 @@ static void *thread_open_close_storm(void *arg)
     for (int i = 0; i < 20; i++)
     {
         int fd = c_sfs_open("storm.txt");
-        if (fd >= 0)
-            c_sfs_close(fd);
+        if (fd < 0)
+            return (void *)(intptr_t)-1;
+        c_sfs_close(fd);
     }
     return NULL;
 }
@@ -1388,22 +1494,25 @@ static int trace_C02(void)
 
     struct rw_mix_arg args[NUM_THREADS];
     pthread_t threads[NUM_THREADS];
+    int nthreads = 0;
     for (int i = 0; i < NUM_THREADS; i++)
     {
         args[i].id = i;
         args[i].do_write = (i % 2 == 0);
-        pthread_create(&threads[i], NULL, thread_rw_mix, &args[i]);
+        if (!start_thread(&threads[i], thread_rw_mix, &args[i]))
+            break;
+        nthreads++;
     }
 
     int ok = 1;
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < nthreads; i++)
     {
         void *ret;
         pthread_join(threads[i], &ret);
         if (ret != NULL)
             ok = 0;
     }
-    CHECK(ok, "concurrent r/w mix failed");
+    CHECK(ok && nthreads == NUM_THREADS, "concurrent r/w mix failed");
     unmount_and_check(CONC_DISK_C02_RW);
     unlink(CONC_DISK_C02_RW);
 
@@ -1414,17 +1523,33 @@ static int trace_C02(void)
     c_sfs_write(fd, "x", 1);
     c_sfs_close(fd);
 
+    nthreads = 0;
     for (int i = 0; i < NUM_THREADS; i++)
-        pthread_create(&threads[i], NULL, thread_open_close_storm, NULL);
-    for (int i = 0; i < NUM_THREADS; i++)
-        pthread_join(threads[i], NULL);
+    {
+        if (!start_thread(&threads[i], thread_open_close_storm, NULL))
+            break;
+        nthreads++;
+    }
+    ok = 1;
+    for (int i = 0; i < nthreads; i++)
+    {
+        void *ret;
+        pthread_join(threads[i], &ret);
+        if (ret != NULL)
+            ok = 0;
+    }
+    CHECK(ok && nthreads == NUM_THREADS,
+          "concurrent open/close storm returned an API error");
 
     sfs_list_cookie cookie = NULL;
     char name[SFS_FILE_NAME_SIZE_LIMIT];
     int count = 0;
-    while (c_sfs_list(&cookie, name, sizeof name) == 0)
+    int list_status;
+    while ((list_status = c_sfs_list(&cookie, name, sizeof name)) == 0)
         count++;
     CHECK(count == 1, "storm: expected 1 file, got %d", count);
+    CHECK(list_status == 1, "storm list should end with status 1, got %d",
+          list_status);
 
     unmount_and_check(CONC_DISK_C02_STORM);
     unlink(CONC_DISK_C02_STORM);
@@ -1435,15 +1560,19 @@ static int trace_C02(void)
 
     pthread_t lister;
     int churn_ids[NUM_THREADS];
-    pthread_create(&lister, NULL, thread_list_during_churn, NULL);
+    int lister_started =
+        start_thread(&lister, thread_list_during_churn, NULL);
+    nthreads = 0;
     for (int i = 0; i < NUM_THREADS; i++)
     {
         churn_ids[i] = i;
-        pthread_create(&threads[i], NULL, thread_dir_churn, &churn_ids[i]);
+        if (!start_thread(&threads[i], thread_dir_churn, &churn_ids[i]))
+            break;
+        nthreads++;
     }
 
     ok = 1;
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < nthreads; i++)
     {
         void *ret;
         pthread_join(threads[i], &ret);
@@ -1451,16 +1580,20 @@ static int trace_C02(void)
             ok = 0;
     }
     atomic_store_explicit(&churn_done, 1, memory_order_release);
-    void *list_ret;
-    pthread_join(lister, &list_ret);
-    CHECK(ok, "directory churn (create/rename/remove) failed");
+    void *list_ret = (void *)(intptr_t)-1;
+    if (lister_started)
+        pthread_join(lister, &list_ret);
+    CHECK(ok && nthreads == NUM_THREADS,
+          "directory churn (create/rename/remove) failed");
     CHECK(list_ret == NULL, "listing during directory churn failed");
 
     cookie = NULL;
     count = 0;
-    while (c_sfs_list(&cookie, name, sizeof name) == 0)
+    while ((list_status = c_sfs_list(&cookie, name, sizeof name)) == 0)
         count++;
     CHECK(count == 0, "churn should leave no files, found %d", count);
+    CHECK(list_status == 1, "churn list should end with status 1, got %d",
+          list_status);
 
     unmount_and_check(CONC_DISK_C02_DIR);
     unlink(CONC_DISK_C02_DIR);
@@ -1475,7 +1608,7 @@ static int trace_C02(void)
 
 /* Workload shape: each thread runs PERF_OUTER_ITERS sessions against
    its own file; a session is one open, then PERF_IO_ROUNDS rounds of
-   write/seek/getpos/read, then one close.  Amortizing open/close over
+   write/getpos/seek/read, then one close.  Amortizing open/close over
    the I/O rounds keeps the (necessarily shared) fd table from
    dominating, so the measurement reflects how well *file data* ops on
    different files proceed in parallel -- the thing the lab asks you
@@ -1487,10 +1620,10 @@ static int trace_C02(void)
    the Makefile, which must stay in sync), and a baseline calibrated
    on a different workload is rejected rather than silently producing
    a meaningless ratio. */
-#define PERF_OUTER_ITERS 2000
+#define PERF_OUTER_ITERS 16000
 #define PERF_IO_ROUNDS 10
 #define PERF_CALLS_PER_THREAD (PERF_OUTER_ITERS * (2 + 4 * PERF_IO_ROUNDS))
-#define PERF_WORKLOAD_VERSION "v2"
+#define PERF_WORKLOAD_VERSION "v3"
 
 /* Scored perf benchmark samples this many times and uses the median.
    Matches baseline calibration (make baseline BASELINE_RUNS=N); odd so
@@ -1498,7 +1631,9 @@ static int trace_C02(void)
    noisy (Docker bind mounts, shared laptops). */
 #define PERF_SAMPLE_RUNS 5
 
-static pthread_barrier_t perf_barrier;
+static pthread_mutex_t perf_start_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t perf_start_cond = PTHREAD_COND_INITIALIZER;
+static int perf_start;
 
 /* Set by any perf worker that observes a wrong return value or wrong
    bytes.  The scored benchmark refuses to award points once this fires,
@@ -1512,7 +1647,10 @@ static void *perf_worker(void *arg)
     char fname[SFS_FILE_NAME_SIZE_LIMIT];
     snprintf(fname, sizeof fname, "perf%d.txt", id);
 
-    pthread_barrier_wait(&perf_barrier);
+    pthread_mutex_lock(&perf_start_lock);
+    while (!perf_start)
+        pthread_cond_wait(&perf_start_cond, &perf_start_lock);
+    pthread_mutex_unlock(&perf_start_lock);
     for (int i = 0; i < PERF_OUTER_ITERS; i++)
     {
         int fd = sfs_open(fname);
@@ -1522,35 +1660,32 @@ static void *perf_worker(void *arg)
                                   memory_order_relaxed);
             continue;
         }
-        ssize_t prev_nr = 0;
+        ssize_t expected_pos = 0;
         for (int k = 0; k < PERF_IO_ROUNDS; k++)
         {
             char data[64];
             int len = snprintf(data, sizeof data, "iter-%d-%d-%d", id, i, k);
             ssize_t nw = sfs_write(fd, data, (size_t)len);
             ssize_t pos = sfs_getpos(fd);
-            ssize_t sk = sfs_seek(fd, -pos);
+            ssize_t sk = sfs_seek(fd, -(ssize_t)len);
             char buf[64];
-            ssize_t nr = sfs_read(fd, buf, sizeof buf);
+            ssize_t nr = sfs_read(fd, buf, (size_t)len);
 
-            /* Validate as we go.  Each round: the write lands at the
-               position the previous read left (0 for round 0, since
-               open resets the position), the seek returns to 0, and
-               the read must cover at least the bytes just written.
-               Round 0 wrote at offset 0, so there the read-back bytes
-               are compared too.  The calibration baseline's getpos and
-               seek are -ENOSYS stubs; position checks are skipped in
+            /* Validate every payload as we go.  Each round writes where the
+               previous read stopped, seeks back by that write's length, and
+               reads the exact bytes just written.  The calibration baseline's
+               getpos and seek are -ENOSYS stubs; position checks are skipped in
                that case, which cannot happen in a scored run because
                correctness (A02/A03) gates the benchmark. */
             if (nw != (ssize_t)len)
                 goto bad;
             if (pos != -ENOSYS)
             {
-                if (pos != prev_nr + nw || sk != 0 || nr < nw)
+                if (pos != expected_pos + nw || sk != expected_pos || nr != nw)
                     goto bad;
-                if (k == 0 && memcmp(buf, data, (size_t)len) != 0)
+                if (memcmp(buf, data, (size_t)len) != 0)
                     goto bad;
-                prev_nr = nr;
+                expected_pos = pos;
             }
         }
         sfs_close(fd);
@@ -1664,8 +1799,8 @@ static int score_perf_absolute(double student_ops)
 /* Score student's ops/sec against the machine-calibrated baseline.
    ratio = student_ops / baseline_ops, where the baseline binary is the
    handout implementation under a single global mutex.  The ladder is
-   calibrated (docs/maintainer/PERF_CALIBRATION.md) so that a correct
-   solution which keeps one global lock measures ~1.0x and earns 3/10,
+   calibrated against real coarse- and fine-grained implementations so a
+   correct solution which keeps one global lock measures ~1.0x and earns 3/10,
    while the scaling a per-file locking scheme delivers (>= ~4.5x on
    the calibration machine) clears the 10/10 bar with a wide margin. */
 static int score_perf_against_baseline(double student_ops)
@@ -1711,9 +1846,10 @@ static int score_perf_against_baseline(double student_ops)
                "scored run:\n");
         printf("    baseline calibrated with SFS_DISK_DIR=%s\n", bi.disk_dir);
         printf("    scored run uses          SFS_DISK_DIR=%s\n", cur_dir);
-        printf("    Ratio below is unreliable -- recalibrate with "
+        printf("    Calibrated ratio will not be used -- recalibrate with "
                "`make baseline`\n");
         printf("    using the same SFS_DISK_DIR value, or unset both.\n");
+        return score_perf_absolute(student_ops);
     }
 
     printf("  Ratio (student / baseline): %.2fx\n", ratio);
@@ -1728,32 +1864,51 @@ static int score_perf_against_baseline(double student_ops)
 
 static double run_perf_benchmark_raw(void)
 {
-    sfs_format(PERF_DISK, disk_size());
-
-    pthread_barrier_init(&perf_barrier, NULL, PERF_THREADS + 1);
+    int err = sfs_format(PERF_DISK, disk_size());
+    if (err != 0)
+    {
+        fprintf(stderr, "perf sfs_format failed: %d\n", err);
+        atomic_store_explicit(&perf_worker_failed, 1, memory_order_relaxed);
+        return 0.0;
+    }
 
     pthread_t threads[PERF_THREADS];
     int ids[PERF_THREADS];
+    int nthreads = 0;
+    pthread_mutex_lock(&perf_start_lock);
+    perf_start = 0;
     for (int i = 0; i < PERF_THREADS; i++)
     {
         ids[i] = i;
-        pthread_create(&threads[i], NULL, perf_worker, &ids[i]);
+        err = pthread_create(&threads[i], NULL, perf_worker, &ids[i]);
+        if (err != 0)
+        {
+            fprintf(stderr, "perf pthread_create failed: %s\n", strerror(err));
+            atomic_store_explicit(&perf_worker_failed, 1,
+                                  memory_order_relaxed);
+            break;
+        }
+        nthreads++;
     }
 
-    /* The barrier releases the workers only after all of them exist,
-       so thread spawn cost stays out of the measurement.  (Spawning 8
-       threads costs ~200us; the old un-barriered 100-iteration
-       workload finished in about that long, which made the reported
-       number mostly scheduler noise.) */
+    /* Take the timestamp while the start gate is locked, then release every
+       worker.  No worker can enter the measured API loop before t0, and thread
+       creation remains outside the measurement. */
     struct timespec t0, t1;
-    pthread_barrier_wait(&perf_barrier);
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    for (int i = 0; i < PERF_THREADS; i++)
+    perf_start = 1;
+    pthread_cond_broadcast(&perf_start_cond);
+    pthread_mutex_unlock(&perf_start_lock);
+    for (int i = 0; i < nthreads; i++)
         pthread_join(threads[i], NULL);
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    pthread_barrier_destroy(&perf_barrier);
 
-    sfs_unmount();
+    err = sfs_unmount();
+    if (err != 0)
+    {
+        fprintf(stderr, "perf sfs_unmount failed: %d\n", err);
+        atomic_store_explicit(&perf_worker_failed, 1, memory_order_relaxed);
+    }
     unlink(PERF_DISK);
 
     double secs = elapsed_sec(&t0, &t1);
@@ -1858,11 +2013,10 @@ static enum tsan_result run_tsan_check(void)
         return TSAN_UNAVAILABLE; // don't penalize if TSan unavailable
     }
 
-    /* On newer kernels (including WSL2), the TSan runtime can abort at
-       startup with "FATAL: ThreadSanitizer: unexpected memory mapping"
-       because of high-entropy ASLR.  That is an environment problem, not
-       a student bug: retry under "setarch -R" (ASLR off for the child),
-       and only report TSan unavailable if even that cannot start. */
+    /* On newer kernels (including WSL2), high-entropy ASLR can make TSan
+       abort or segfault before main.  That is an environment problem, not a
+       student bug: retry under "setarch -R" (ASLR off for the child), and
+       only report TSan unavailable if even that cannot start. */
     char wrap[96] = "";
     enum tsan_result result = TSAN_CLEAN;
 
@@ -1874,7 +2028,10 @@ static enum tsan_result run_tsan_check(void)
                  wrap, tsan_bin, seed, tsan_log);
         rc = system(run_cmd);
 
-        if (log_contains(tsan_log, "FATAL: ThreadSanitizer"))
+        int runtime_fatal =
+            log_contains(tsan_log, "FATAL: ThreadSanitizer");
+        int driver_started = log_contains(tsan_log, "Category C (TSan):");
+        if (runtime_fatal || (rc != 0 && !driver_started))
         {
             struct utsname un;
             if (wrap[0] == '\0' &&
@@ -1945,22 +2102,20 @@ struct trace_entry
 };
 
 #define TRACE_TIMEOUT_SEC 30
+#define TRACE_CAPTURE_LIMIT (1024U * 1024U)
 
-/* Append 'n' bytes from 'src' to a dynamically-grown buffer whose state is
-   held in the three out-params pbuf, pcap, plen.  Silently drops the data
-   on allocation failure. */
-static void capture_append(char **pbuf, size_t *pcap, size_t *plen,
-                           const char *src, size_t n)
+/* Append up to TRACE_CAPTURE_LIMIT bytes from a child.  The pipe is still
+   drained after the cap so debug-print floods cannot block the child or grow
+   the grader without bound. */
+static void capture_append(char **pbuf, size_t *plen, const char *src,
+                           size_t n)
 {
-    if (*plen + n > *pcap)
-    {
-        size_t nc = *pcap ? *pcap : 4096;
-        while (nc < *plen + n) nc *= 2;
-        char *nb = realloc(*pbuf, nc);
-        if (!nb) return;
-        *pbuf = nb;
-        *pcap = nc;
-    }
+    if (*pbuf == NULL || *plen >= TRACE_CAPTURE_LIMIT)
+        return;
+    if (n > TRACE_CAPTURE_LIMIT - *plen)
+        n = TRACE_CAPTURE_LIMIT - *plen;
+    if (n == 0)
+        return;
     memcpy(*pbuf + *plen, src, n);
     *plen += n;
 }
@@ -1971,7 +2126,7 @@ static void capture_append(char **pbuf, size_t *pcap, size_t *plen,
      1 = trace failed (a CHECK inside it failed and set trace_ok = 0)
 
    The child's stderr is redirected into a pipe so the parent can append
-   the captured FAIL lines to *out_buf (grown with capture_append). This
+   the captured FAIL lines to *out_buf. This
    lets run_category print the summary line BEFORE the FAIL details, same
    as the memstream path for A/B traces. TIMEOUT/CRASH diagnostics are
    appended to the capture too, so they share the same ordering rules.
@@ -1979,9 +2134,8 @@ static void capture_append(char **pbuf, size_t *pcap, size_t *plen,
 static int run_trace_with_timeout(const char *id, trace_fn fn,
                                   char **out_buf, size_t *out_len)
 {
-    *out_buf = NULL;
+    *out_buf = malloc(TRACE_CAPTURE_LIMIT);
     *out_len = 0;
-    size_t cap = 0;
 
     fflush(stdout);
     fflush(stderr);
@@ -2020,10 +2174,11 @@ static int run_trace_with_timeout(const char *id, trace_fn fn,
     int flags = fcntl(pfd[0], F_GETFL);
     if (flags >= 0) fcntl(pfd[0], F_SETFL, flags | O_NONBLOCK);
 
-    int elapsed_ms = 0;
     const int step_ms = 100;
     int status = 0;
     int timed_out = 0;
+    struct timespec started;
+    clock_gettime(CLOCK_MONOTONIC, &started);
 
     for (;;)
     {
@@ -2033,7 +2188,7 @@ static int run_trace_with_timeout(const char *id, trace_fn fn,
         {
             ssize_t n = read(pfd[0], tmp, sizeof tmp);
             if (n > 0)
-                capture_append(out_buf, &cap, out_len, tmp, (size_t)n);
+                capture_append(out_buf, out_len, tmp, (size_t)n);
             else if (n == 0)
                 break;  /* EOF: child closed write end */
             else if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -2046,11 +2201,15 @@ static int run_trace_with_timeout(const char *id, trace_fn fn,
         if (r == pid) break;
         if (r < 0)
         {
+            if (errno == EINTR)
+                continue;
             fprintf(stderr, "waitpid: %s\n", strerror(errno));
             close(pfd[0]);
             return 0;
         }
-        if (elapsed_ms >= TRACE_TIMEOUT_SEC * 1000)
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (elapsed_sec(&started, &now) >= (double)TRACE_TIMEOUT_SEC)
         {
             timed_out = 1;
             break;
@@ -2059,7 +2218,6 @@ static int run_trace_with_timeout(const char *id, trace_fn fn,
         /* Sleep up to step_ms, but wake early if pipe becomes readable. */
         struct pollfd pf = { .fd = pfd[0], .events = POLLIN };
         poll(&pf, 1, step_ms);
-        elapsed_ms += step_ms;
     }
 
     if (timed_out)
@@ -2074,17 +2232,17 @@ static int run_trace_with_timeout(const char *id, trace_fn fn,
         {
             ssize_t n = read(pfd[0], tmp2, sizeof tmp2);
             if (n <= 0) break;
-            capture_append(out_buf, &cap, out_len, tmp2, (size_t)n);
+            capture_append(out_buf, out_len, tmp2, (size_t)n);
         }
         char msg[160];
         int m = snprintf(msg, sizeof msg,
                          "       -> TIMEOUT: trace %s exceeded %d seconds "
                          "(deadlock suspected); killed\n",
                          id, TRACE_TIMEOUT_SEC);
-        if (m > 0) capture_append(out_buf, &cap, out_len, msg, (size_t)m);
+        if (m > 0) capture_append(out_buf, out_len, msg, (size_t)m);
         if (hint)
         {
-            capture_append(out_buf, &cap, out_len, hint, strlen(hint));
+            capture_append(out_buf, out_len, hint, strlen(hint));
             free(hint);
         }
         close(pfd[0]);
@@ -2097,7 +2255,7 @@ static int run_trace_with_timeout(const char *id, trace_fn fn,
     {
         ssize_t n = read(pfd[0], tmp, sizeof tmp);
         if (n <= 0) break;
-        capture_append(out_buf, &cap, out_len, tmp, (size_t)n);
+        capture_append(out_buf, out_len, tmp, (size_t)n);
     }
     close(pfd[0]);
 
@@ -2116,11 +2274,11 @@ static int run_trace_with_timeout(const char *id, trace_fn fn,
         int m = snprintf(msg, sizeof msg,
                          "       -> CRASH: trace %s killed by signal %d\n",
                          id, WTERMSIG(status));
-        if (m > 0) capture_append(out_buf, &cap, out_len, msg, (size_t)m);
+        if (m > 0) capture_append(out_buf, out_len, msg, (size_t)m);
     }
     if (hint)
     {
-        capture_append(out_buf, &cap, out_len, hint, strlen(hint));
+        capture_append(out_buf, out_len, hint, strlen(hint));
         free(hint);
     }
     return 0;
@@ -2189,7 +2347,7 @@ int main(int argc, char *argv[])
     if (sched_fuzz_seed != 0)
         fprintf(stderr, "Schedule fuzz active (seed %u)\n", sched_fuzz_seed);
 
-    keep_failed_disks = !mode_tsan_only;
+    keep_failed_disks = !mode_tsan_only && !quiet_mode;
     const char *kfd = getenv("SFS_KEEP_FAILED_DISKS");
     if (kfd && *kfd)
         keep_failed_disks = strcmp(kfd, "0") != 0;
@@ -2217,11 +2375,13 @@ int main(int argc, char *argv[])
     {
         double baseline_ops = run_perf_benchmark_raw();
         printf("%.2f\n", baseline_ops);
-        if (atomic_load_explicit(&perf_worker_failed, memory_order_relaxed))
+        int failed = atomic_load_explicit(&perf_worker_failed,
+                                          memory_order_relaxed);
+        if (failed)
             fprintf(stderr, "warning: perf workload self-checks failed; "
                     "this number is not meaningful\n");
         unlink(DISK_NAME);
-        return 0;
+        return failed ? 1 : 0;
     }
 
     struct trace_entry cat_a[] = {

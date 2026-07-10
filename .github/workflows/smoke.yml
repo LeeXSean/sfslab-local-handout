@@ -18,6 +18,9 @@ jobs:
           cd sfslab
           ./test-sfs -q && exit 1 || test $? -eq 1
 
+      - name: Exercise performance baseline and self-checks
+        run: make -C sfslab baseline BASELINE_RUNS=3
+
       # The graded TSan sweep only runs at 12/12, which the starter never
       # reaches, so exercise the machinery directly: the self-compile
       # command must work and the TSan runtime must start (functional
@@ -31,7 +34,8 @@ jobs:
               -o test-sfs-tsan test-sfs.c sfs-disk.c sfs-support.c
           timeout 20s ./test-sfs-tsan --tsan-only --sched-fuzz=1 \
               > /tmp/tsan.log 2>&1 || true
-          if grep -q "FATAL: ThreadSanitizer" /tmp/tsan.log; then
+          if grep -q "FATAL: ThreadSanitizer" /tmp/tsan.log \
+              || ! grep -q "Category C (TSan):" /tmp/tsan.log; then
             timeout 20s setarch "$(uname -m)" -R ./test-sfs-tsan --tsan-only \
                 --sched-fuzz=1 > /tmp/tsan.log 2>&1 || true
           fi

@@ -221,6 +221,7 @@ static int map_disk_image(const char *image_name,
     if (fstat(fd, &st))
     {
         perror(image_name);
+        close(fd);
         return -1;
     }
 
@@ -228,6 +229,7 @@ static int map_disk_image(const char *image_name,
     if (st.st_size == 0)
     {
         fprintf(stderr, "%s: error: disk image is empty\n", image_name);
+        close(fd);
         return 1;
     }
     if (st.st_size > (off_t)SSIZE_MAX || (size_t)st.st_size > SFS_MAX_DISK_SIZE)
@@ -237,6 +239,7 @@ static int map_disk_image(const char *image_name,
             "%s: error: disk image is too large to hold an SFS file system\n"
             "    (image size: %llu bytes; max supported size: %zu bytes)\n",
             image_name, (unsigned long long)st.st_size, SFS_MAX_DISK_SIZE);
+        close(fd);
         return -1;
     }
     size_t image_size = (size_t)st.st_size;
@@ -259,6 +262,7 @@ static int map_disk_image(const char *image_name,
                 "%s: error: image size (%zu bytes) is not a multiple"
                 " of the system page size (%zu bytes)\n",
                 image_name, image_size, pagesize);
+        close(fd);
         return -1;
     }
 
@@ -266,6 +270,7 @@ static int map_disk_image(const char *image_name,
     if (mapping == MAP_FAILED)
     {
         perror(image_name);
+        close(fd);
         return -1;
     }
     close(fd);
@@ -280,10 +285,10 @@ static const sfs_block_hdr_t *get_block(const sfs_filesystem_t *superblock,
 {
     if (id == 0)
         return NULL;
-    if (id > superblock->n_blocks)
+    if (id >= superblock->n_blocks)
         abort();
     return (sfs_block_hdr_t *)(((const char *)superblock) +
-                               SFS_BLOCK_SIZE * id);
+                               (size_t)SFS_BLOCK_SIZE * id);
 }
 
 /** Validate one list of blocks, whose first block is FIRST_ID.
@@ -330,18 +335,18 @@ static int check_blocklist(const char *disk, const sfs_filesystem_t *superblock,
     int status = 0;
     while (cur_id)
     {
-        if (cur_id > superblock->n_blocks)
+        if (cur_id >= superblock->n_blocks)
         {
             if (prev_id == 0)
                 fprintf(stderr,
                         "%s: error: first block of %s is out of range"
-                        " (id %u > %u)",
+                        " (id %u >= %u)\n",
                         disk, block_label(list_type), cur_id,
                         superblock->n_blocks);
             else
                 fprintf(stderr,
                         "%s: error: block %u of %s points to next block"
-                        " %u which is out of range (> %u)",
+                        " %u which is out of range (>= %u)\n",
                         disk, prev_id, block_label(list_type), cur_id,
                         superblock->n_blocks);
             return 1;
@@ -441,7 +446,7 @@ static int check_superblock(const char *disk,
         return -1;
     }
 
-    unsigned char *bytemap = malloc(superblock->n_blocks + 1);
+    unsigned char *bytemap = malloc((size_t)superblock->n_blocks + 1);
     if (!bytemap)
     {
         perror("bytemap");
@@ -550,6 +555,15 @@ static int check_directory_entries(const char *disk,
         }
         status |= name_err;
 
+        /* File ownership tags occupy one byte.  Once all 250 tags have been
+           used, keep validating names but do not feed a wrapped control tag
+           to check_blocklist, which would abort on malformed input. */
+        if (file_tag < B_file0)
+        {
+            status = 1;
+            continue;
+        }
+
         // ... and the size should agree with the number of allocated
         // blocks, assuming the allocation list is valid.
         uint32_t nblocks = 0;
@@ -562,8 +576,9 @@ static int check_directory_entries(const char *disk,
             uint32_t exp_nblocks = 1;
             if (files[i].size)
             {
-                exp_nblocks =
-                    (files[i].size + BLOCK_DATA_SIZE - 1) / BLOCK_DATA_SIZE;
+                exp_nblocks = (uint32_t)(((size_t)files[i].size +
+                                          BLOCK_DATA_SIZE - 1) /
+                                         BLOCK_DATA_SIZE);
             }
             if (exp_nblocks != nblocks)
             {
@@ -648,6 +663,7 @@ static int check_for_lost_blocks(const char *disk,
          c = (unsigned char *)strchr((const char *)(c + 1), B_unvisited))
     {
         block_id i = (block_id)(c - bytemap);
+        assert(i != 0);
         const sfs_block_hdr_t *h = get_block(superblock, i);
         const char *label = sfs_block_type_label(h->type);
         if (label)
@@ -911,11 +927,20 @@ int main(int argc, char **argv)
 
     unsigned char *bytemap;
     if (check_superblock(disk, superblock, imagesize, &bytemap))
+    {
+        munmap(superblock, imagesize);
         return 1;
+    }
 
     int status = check_root_directory(disk, superblock, bytemap);
     status |= check_for_lost_blocks(disk, superblock, bytemap);
     free(bytemap);
+
+    if (munmap(superblock, imagesize) != 0)
+    {
+        perror(disk);
+        status = 1;
+    }
 
     if (status == 0 && verbose)
     {

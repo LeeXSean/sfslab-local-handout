@@ -72,12 +72,15 @@ int sfs_unmount(void);
     want to read or write; you can do both.  If the file doesn't
     exist, it is created.
 
+    An empty file name is invalid and returns -EINVAL.
+    If creating a new file fails, no directory entry or data block is retained.
+
     Return a non-negative "file descriptor" on success, or a negative
     error code.  (The "file descriptor" can only be used with other
     sfs-disk routines, not with real system calls.)  */
 int sfs_open(const char *fileName);
 
-/** Close a "file descriptor" returned by openFile.
+/** Close a "file descriptor" returned by sfs_open.
     This function cannot fail.  If you call it with an argument that
     isn't a valid "file descriptor", it just doesn't do anything.  */
 void sfs_close(int fd);
@@ -105,6 +108,9 @@ ssize_t sfs_read(int fd, char *buf, size_t len);
     common reason being that you hit some kind of size limit after
     writing _some_ but not _all_ of the bytes.
 
+    If the requested ending position cannot fit in SFS's 32-bit on-disk file
+    size, return -EFBIG without writing anything or advancing the position.
+
     Return the number of bytes that were actually written, or a
     negative error code.  */
 ssize_t sfs_write(int fd, const char *buf, size_t len);
@@ -131,15 +137,19 @@ ssize_t sfs_seek(int fd, ssize_t delta);
     Returns 0 on success, or a negative error code, such as:
 
     -ENOENT          The file already doesn't exist.
+    -EINVAL          NAME is empty.
     -ENAMETOOLONG    NAME is too long for SFS.  */
 int sfs_remove(const char *name);
 
 /** Rename the file currently named OLD_NAME to NEW_NAME.
 
-    If NEW_NAME already exists, atomically delete it and replace it
-    with the file named OLD_NAME.  "Atomically" means that there
+    If OLD_NAME and NEW_NAME are equal and the file exists, succeed without
+    changing anything.  If NEW_NAME already exists, atomically delete it and
+    replace it with the file named OLD_NAME.  "Atomically" means that there
     shouldn't be any gap in which a concurrent thread can observe
     NEW_NAME not existing.
+
+    Empty names are invalid and return -EINVAL.
 
     Returns 0 on success, or a negative error code. */
 int sfs_rename(const char *old_name, const char *new_name);
@@ -150,8 +160,8 @@ int sfs_rename(const char *old_name, const char *new_name);
         sfs_list_cookie cookie = NULL;
         char filename[SFS_FILE_NAME_SIZE_LIMIT];
         int status;
-        while ((status = sfs_list(&cookie, &filename,
-                                  FILE_NAME_SIZE_LIMIT)) == 0) {
+        while ((status = sfs_list(&cookie, filename,
+                                  SFS_FILE_NAME_SIZE_LIMIT)) == 0) {
           // do something with 'filename' here
         }
         if (status < 0) {

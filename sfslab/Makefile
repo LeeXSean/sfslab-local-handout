@@ -40,6 +40,10 @@ test: test-sfs sfs-fsck
 BASELINE_RUNS ?= 5
 
 baseline: test-sfs-baseline
+	@case "$(BASELINE_RUNS)" in \
+	  ''|*[!0-9]*|0|*[02468]) \
+	    echo "BASELINE_RUNS must be a positive odd integer" >&2; exit 2;; \
+	esac
 	@echo "Calibrating machine baseline ($(BASELINE_RUNS) runs, median)..."
 	@rm -f .perf_baseline.tmp
 	@i=1; while [ $$i -le $(BASELINE_RUNS) ]; do \
@@ -53,7 +57,7 @@ baseline: test-sfs-baseline
 	  | awk -v n=$(BASELINE_RUNS) 'NR==int((n+1)/2){print; exit}' \
 	  > .perf_baseline
 	@printf 'SFS_DISK_DIR=%s\n' "$${SFS_DISK_DIR:-(unset)}" >> .perf_baseline
-	@printf 'WORKLOAD=v2\n' >> .perf_baseline  # keep in sync with PERF_WORKLOAD_VERSION (test-sfs.c)
+	@printf 'WORKLOAD=v3\n' >> .perf_baseline  # keep in sync with PERF_WORKLOAD_VERSION (test-sfs.c)
 	@awk 'NR==1{min=$$1; max=$$1} \
 	      {if($$1<min)min=$$1; if($$1>max)max=$$1} \
 	      END{printf "  spread: min=%.2f max=%.2f (%.1f%% of midpoint)\n", \
