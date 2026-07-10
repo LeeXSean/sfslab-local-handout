@@ -1,7 +1,21 @@
 # Developer Branch
 
-This branch is an experimental implementation branch, not the course-shaped
-starter on `main`. Do not merge it into `main` or publish it as an answer key.
+This branch is the course-shaped starter plus implemented developer extensions.
+It is not a completed lab solution: `sfs_getpos`, `sfs_seek`, `sfs_rename`, and
+student synchronization remain deliberately unfinished. Do not merge it into
+`main` or publish completed student work here.
+
+## Relationship To Main
+
+| Area | `main` | `developer` |
+| --- | --- | --- |
+| Scored student task | Three APIs plus synchronization | Unchanged |
+| File-size API | Not present | `sfs_fstat`, `sfs_ftruncate` |
+| Optional routes | Course-shaped starter behavior | X00, X01, X02 implemented |
+| Automatic score | 22 points | Same 22 points; D/X are separate |
+
+Use `main` for a faithful starter exercise. Use `developer` to inspect or extend
+the additional filesystem semantics without turning them into score requirements.
 
 ## Implemented Extensions
 
@@ -36,6 +50,10 @@ make x-traces
 branch's zero-block encoding. Read, write, and truncate preserve compatibility
 with those old images. Its ownership map also uses wide tags, so checking an
 expanded directory is not capped at 250 files.
+
+Compatibility is intentionally one-way: developer code accepts original images,
+but images containing `SFS_EMPTY_FILE_BLOCK` are not intended for tools from
+`main`.
 
 ## Deliberate Non-Change
 

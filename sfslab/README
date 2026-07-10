@@ -1,11 +1,15 @@
 #####################################################################
 # SFS Lab: Writing a Multithreaded File System
 #
-# Student handout files
+# Developer-edition student handout files
 #####################################################################
 
 For a full description of the lab, see the writeup (sfslab.pdf),
 which is extracted alongside the sfslab/ directory.
+
+This branch provides the unscored D/X extensions.  It deliberately leaves
+sfs_getpos, sfs_seek, sfs_rename, and student synchronization unfinished;
+use main instead when you want the course-shaped starter semantics.
 
 ***********
 Main files:
@@ -50,7 +54,12 @@ To run the autograder:
 
     unix> ./test-sfs
 
-The unmodified handout is expected to fail some traces: sfs_getpos,
+To run the developer-only checks (not scored):
+
+    unix> make developer-test
+    unix> make x-traces
+
+The developer starter is expected to fail some traces: sfs_getpos,
 sfs_seek, and sfs_rename are intentionally left for you to implement.
 
 Before reading anything into the performance score, calibrate the
@@ -63,6 +72,6 @@ machine changes):
 Run everything from this directory; the driver expects ./sfs-fsck
 and ./.perf_baseline to be reachable from the working directory.
 
-Developer branch only: "make developer-test" checks sfs_fstat and
-sfs_ftruncate, and "make x-traces" checks the three unscored optional
-design routes.  These checks do not affect the 22-point score.
+The developer checks cover sfs_fstat/sfs_ftruncate and the zero-block empty
+file, expandable-directory, and Unix-unlink routes.  They do not affect the
+22-point score.

@@ -3,6 +3,9 @@
 Offline self-study packaging for CMU 15-213 / 15-513's Shark File System
 (SFS) lab. This is not an official CMU release; see `NOTICE.md`.
 
+> **Branch:** `developer` keeps the scored starter tasks unfinished while
+> providing the unscored file-size and X-route implementations.
+
 ## Getting Started
 
 Run this inside Linux, WSL, or a Linux container:
@@ -33,10 +36,8 @@ writeup/             groff source for sfslab.pdf (make pdf)
 Maintainer targets, from the repository root: `make dist` rebuilds the
 tarball deterministically; `make pdf` rebuilds the writeup.
 
-The `developer` branch additionally implements the historical file-size and
-optional-design routes. They are unscored and exercised by `make
-developer-test` and `make x-traces`; see `docs/maintainer/DEVELOPER.md`. Use
-`main` for the course-shaped starter.
+The extensions are exercised by `make developer-test` and `make x-traces`; see
+`docs/maintainer/DEVELOPER.md`. Use `main` for the course-shaped starter.
 
 ## Disclaimer
 
