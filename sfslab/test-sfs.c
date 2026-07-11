@@ -99,7 +99,7 @@ static void cleanup_concurrency_disks(void)
 /* Keep a copy of a failing trace's disk image(s) for post-mortem fsck.
    On by default for human runs; off under --tsan-only so the sanitizer
    sweep stays clean.  SFS_KEEP_FAILED_DISKS=0/1 overrides.
-   The copies match the *.img cleanup glob (make clean). */
+   The copies match the fail_*.img cleanup glob (make clean). */
 static int keep_failed_disks;
 static int quiet_mode;   /* -q: suppress all FAIL detail output */
 
@@ -826,7 +826,8 @@ static int trace_B02(void)
     CHECK(nr == 3, "read(3) returned %zd", nr);
     pos = sfs_getpos(fd);
     CHECK(pos == 10, "getpos after read(7)+read(3) should be 10, got %zd", pos);
-    CHECK(memcmp(buf, "789", 3) == 0, "read(3) data mismatch");
+    if (nr == 3)
+        CHECK(memcmp(buf, "789", 3) == 0, "read(3) data mismatch");
     sfs_close(fd);
 
     /* double open: independent positions */
@@ -935,6 +936,8 @@ static int trace_B02(void)
             probe_err = pfd;
             break;
         }
+        for (int j = 0; j < n_open; j++)
+            CHECK(pfd != fds[j], "open #%d reused live fd %d", i + 1, pfd);
         fds[n_open++] = pfd;
     }
     CHECK(n_open >= 32,

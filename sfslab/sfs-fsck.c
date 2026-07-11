@@ -118,7 +118,7 @@ static const char *sfs_block_type_label(const unsigned char *code)
     }
     else if (!memcmp(code, SFS_BLOCK_TYPE_DIR, 4))
     {
-        return "part a directory";
+        return "part of a directory";
     }
     else if (!memcmp(code, SFS_BLOCK_TYPE_FREE, 4))
     {
@@ -191,7 +191,7 @@ static void report_bad_block_type(const char *disk, block_id b,
     }
     else
     {
-        fputs("but it has invalid type tag '", stderr);
+        fputs(" but it has invalid type tag '", stderr);
         fput_escaped_n(got, 4, stderr);
         fputs("'\n", stderr);
     }

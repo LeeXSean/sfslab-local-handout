@@ -38,7 +38,6 @@ dist:
 	  echo "warning: sfslab.pdf is older than writeup/sfslab.roff;" >&2; \
 	  echo "         run 'make pdf' first or the tarball ships a stale writeup" >&2; \
 	fi
-	$(MAKE) -C $(HANDOUT) clean
 	@tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/sfslab-dist.XXXXXX"); \
 	trap 'rm -rf "$$tmp"' EXIT HUP INT TERM; \
 	mkdir "$$tmp/$(HANDOUT)"; \
