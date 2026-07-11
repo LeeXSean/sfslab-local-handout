@@ -811,7 +811,8 @@ static int trace_B02(void)
     CHECK(nr == 3, "read(3) returned %zd", nr);
     pos = sfs_getpos(fd);
     CHECK(pos == 10, "getpos after read(7)+read(3) should be 10, got %zd", pos);
-    CHECK(memcmp(buf, "789", 3) == 0, "read(3) data mismatch");
+    if (nr == 3)
+        CHECK(memcmp(buf, "789", 3) == 0, "read(3) data mismatch");
     sfs_close(fd);
 
     /* double open: independent positions */
@@ -920,6 +921,8 @@ static int trace_B02(void)
             probe_err = pfd;
             break;
         }
+        for (int j = 0; j < n_open; j++)
+            CHECK(pfd != fds[j], "open #%d reused live fd %d", i + 1, pfd);
         fds[n_open++] = pfd;
     }
     CHECK(n_open >= 32,

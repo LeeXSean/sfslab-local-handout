@@ -121,7 +121,7 @@ static const char *sfs_block_type_label(const unsigned char *code)
     }
     else if (!memcmp(code, SFS_BLOCK_TYPE_DIR, 4))
     {
-        return "part a directory";
+        return "part of a directory";
     }
     else if (!memcmp(code, SFS_BLOCK_TYPE_FREE, 4))
     {
@@ -199,7 +199,7 @@ static void report_bad_block_type(const char *disk, block_id b,
     }
     else
     {
-        fputs("but it has invalid type tag '", stderr);
+        fputs(" but it has invalid type tag '", stderr);
         fput_escaped_n(got, 4, stderr);
         fputs("'\n", stderr);
     }
@@ -560,6 +560,14 @@ static int check_directory_entries(const char *disk,
            to check_blocklist, which would abort on malformed input. */
         if (file_tag < B_file0)
         {
+            if (file_tag == B_end_of_disk)
+            {
+                fprintf(stderr,
+                        "%s: internal error: out of file tags!\n"
+                        "    Contact course staff for assistance.\n",
+                        disk);
+                file_tag = B_corrupt;
+            }
             status = 1;
             continue;
         }
@@ -589,16 +597,7 @@ static int check_directory_entries(const char *disk,
                 status = 1;
             }
         }
-
         file_tag++;
-        if (file_tag == 0)
-        {
-            fprintf(stderr,
-                    "%s: internal error: out of file tags!\n"
-                    "    Contact course staff for assistance.\n",
-                    disk);
-            status = 1;
-        }
     }
 
     *file_tag_p = file_tag;

@@ -73,7 +73,8 @@ grade: test-sfs test-sfs-baseline sfs-fsck
 .PHONY: grade
 
 clean:
-	-rm -f $(PROGRAMS) test-sfs-tsan *.o *.img tsan_output.log .perf_baseline .perf_baseline.tmp
+	-rm -f $(PROGRAMS) test-sfs-tsan *.o test.img test_conc_*.img \
+		test_perf.img fail_*.img tsan_output.log .perf_baseline .perf_baseline.tmp
 .PHONY: clean
 
 ## cut here ##
