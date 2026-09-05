@@ -80,4 +80,5 @@ cd sfslab && ./test-sfs -q
 ```
 
 The ordinary 22-point score stays separate from Categories D and X. The
-incomplete starter still reports `6/22` and exits 1.
+incomplete starter exits 1; concurrent results vary until locks are added.
+Use `make grade` for the optional 22-point benchmark.

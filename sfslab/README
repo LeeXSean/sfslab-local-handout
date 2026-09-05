@@ -1,7 +1,7 @@
 #####################################################################
 # SFS Lab: Writing a Multithreaded File System
 #
-# Developer-edition student handout files
+# Optional extension handout
 #####################################################################
 
 For a full description of the lab, see the writeup (sfslab.pdf),
@@ -19,7 +19,7 @@ sfs-disk.c
         The SFS implementation.  This is the only file you need to
         edit.  It contains three unimplemented functions (sfs_getpos,
         sfs_seek, sfs_rename) and, once those work, it is where you
-        add locking to make the file system thread-safe and scalable.
+        add locking to make the file system thread-safe; parallel speedup is optional.
 
 sfs-api.h
         The API specification you are implementing.  Read the doc
@@ -68,10 +68,15 @@ machine changes):
 
     unix> make baseline
 
-"make grade" runs the calibration and the autograder in one step.
+"make test" checks correctness. "make grade" adds the optional performance
+benchmark after calibration; its thresholds are local, not official CMU grades.
 Run everything from this directory; the driver expects ./sfs-fsck
 and ./.perf_baseline to be reachable from the working directory.
 
 The developer checks cover sfs_fstat/sfs_ftruncate and the zero-block empty
 file, expandable-directory, and Unix-unlink routes.  They do not affect the
 22-point score.
+
+Tests use a private sfs-test.* directory. Failed images stay there for
+inspection; make clean never removes disk images. Concurrent starter failures
+are expected until synchronization is implemented.

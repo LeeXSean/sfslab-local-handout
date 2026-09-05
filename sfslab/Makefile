@@ -78,12 +78,11 @@ baseline: test-sfs-baseline
 # Calibrate the baseline, then run the autograder.
 grade: test-sfs test-sfs-baseline sfs-fsck
 	$(MAKE) baseline
-	./test-sfs
+	./test-sfs --benchmark
 .PHONY: grade
 
 clean:
-	-rm -f $(PROGRAMS) test-sfs-tsan *.o test.img test_conc_*.img \
-		test_perf.img fail_*.img tsan_output.log .perf_baseline .perf_baseline.tmp
+	-rm -f $(PROGRAMS) test-sfs-tsan *.o tsan_output.log .perf_baseline .perf_baseline.tmp
 .PHONY: clean
 
 ## cut here ##

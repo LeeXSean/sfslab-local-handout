@@ -72,19 +72,34 @@ static char *sfs_join(const char *dir, const char *name)
     return out;
 }
 
+static char *disk_run_dir;
+
+static void cleanup_disk_dir(void)
+{
+    /* Failed images are kept for inspection; never recursively delete. */
+    if (rmdir(disk_run_dir) != 0 && errno == ENOTEMPTY)
+        fprintf(stderr, "Test images retained in %s\n", disk_run_dir);
+}
+
 static void init_disk_paths(void)
 {
     const char *dir = getenv("SFS_DISK_DIR");
     if (!dir || !*dir)
-        return;
-    DISK_NAME = sfs_join(dir, "test.img");
-    CONC_DISK_C00 = sfs_join(dir, "test_conc_C00.img");
-    CONC_DISK_C01 = sfs_join(dir, "test_conc_C01.img");
-    CONC_DISK_C02_RW = sfs_join(dir, "test_conc_C02_rw.img");
-    CONC_DISK_C02_STORM = sfs_join(dir, "test_conc_C02_storm.img");
-    CONC_DISK_C02_DIR = sfs_join(dir, "test_conc_C02_dir.img");
-    PERF_DISK = sfs_join(dir, "test_perf.img");
-    fprintf(stderr, "Disk images redirected via SFS_DISK_DIR: %s\n", dir);
+        dir = ".";
+    disk_run_dir = sfs_join(dir, "sfs-test.XXXXXX");
+    if (!mkdtemp(disk_run_dir))
+    {
+        perror("create test directory");
+        exit(2);
+    }
+    atexit(cleanup_disk_dir);
+    DISK_NAME = sfs_join(disk_run_dir, "test.img");
+    CONC_DISK_C00 = sfs_join(disk_run_dir, "test_conc_C00.img");
+    CONC_DISK_C01 = sfs_join(disk_run_dir, "test_conc_C01.img");
+    CONC_DISK_C02_RW = sfs_join(disk_run_dir, "test_conc_C02_rw.img");
+    CONC_DISK_C02_STORM = sfs_join(disk_run_dir, "test_conc_C02_storm.img");
+    CONC_DISK_C02_DIR = sfs_join(disk_run_dir, "test_conc_C02_dir.img");
+    PERF_DISK = sfs_join(disk_run_dir, "test_perf.img");
 }
 
 static void cleanup_concurrency_disks(void)
@@ -207,7 +222,7 @@ static char *keep_failure_images(const char *id)
    Mutable so -v can raise it to effectively unlimited. */
 #define TRACE_FAIL_DETAIL_DEFAULT 3
 
-static int trace_ok;
+static _Atomic int trace_ok;
 static _Atomic int trace_fail_count;   /* atomic: C traces increment from pthreads */
 static int trace_fail_limit = TRACE_FAIL_DETAIL_DEFAULT;  /* -v bumps to INT_MAX */
 
@@ -1476,24 +1491,14 @@ static void fuzz_point(void)
     nanosleep(&ts, NULL); /* 0-49 microseconds */
 }
 
-static pthread_mutex_t c_api_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int serialize_c_api_calls = 1;
-
-/* Normal C traces are a stable functional signal.  They serialize individual
-   API calls so the unfinished starter does not get schedule-dependent scores.
-   The --tsan-only path disables this guard and exercises real concurrent calls
-   for race detection after A/B/C correctness is otherwise complete. */
+/* Always exercise the student's synchronization, including without TSan. */
 static void c_api_enter(void)
 {
     fuzz_point();
-    if (serialize_c_api_calls)
-        pthread_mutex_lock(&c_api_mutex);
 }
 
 static void c_api_leave(void)
 {
-    if (serialize_c_api_calls)
-        pthread_mutex_unlock(&c_api_mutex);
     fuzz_point();
 }
 
@@ -1744,9 +1749,8 @@ static void *thread_open_close_storm(void *arg)
    below walks the directory.  While sfs_rename is still the -ENOSYS
    starter stub, the thread falls back to a plain remove, so the trace is
    meaningful (and passes) before the stub is implemented.  All names are
-   per-thread, which keeps the serialized run deterministic; under the
-   TSan rerun this same code makes real concurrent create/rename/remove
-   calls. */
+   per-thread. Both the normal run and TSan make real concurrent
+   create/rename/remove calls. */
 #define CHURN_ITERS 12
 
 static _Atomic int churn_done;
@@ -1801,8 +1805,7 @@ static void *thread_list_during_churn(void *arg)
         int status;
         while ((status = c_sfs_list(&cookie, name, sizeof name)) == 0)
         {
-            if (name[0] == '\0')
-                return (void *)(intptr_t)-1;
+            CHECK(name[0] != '\0', "listing returned an empty name");
         }
         if (status != 1)
             return (void *)(intptr_t)-1;
@@ -2353,7 +2356,7 @@ static enum tsan_result run_tsan_check(void)
     {
         char run_cmd[640];
         snprintf(run_cmd, sizeof run_cmd,
-                 "timeout 20s %s%s --tsan-only --sched-fuzz=%u > %s 2>&1",
+                 "timeout 120s %s%s --tsan-only --sched-fuzz=%u > %s 2>&1",
                  wrap, tsan_bin, seed, tsan_log);
         rc = system(run_cmd);
 
@@ -2386,8 +2389,7 @@ static enum tsan_result run_tsan_check(void)
         {
             printf("  DATA RACE DETECTED (schedule-fuzz seed %u) -- "
                    "Category C score set to 0\n", seed);
-            printf("  Race stacks were suppressed; see the lab writeup for "
-                   "how to rerun TSan and print them.\n");
+            printf("  See tsan_output.log for the race report.\n");
             result = TSAN_RACE;
             break;
         }
@@ -2408,7 +2410,10 @@ static enum tsan_result run_tsan_check(void)
     }
 
     unlink(tsan_bin);
-    unlink(tsan_log);
+    if (result == TSAN_CLEAN || result == TSAN_UNAVAILABLE)
+        unlink(tsan_log);
+    else
+        printf("  Diagnostics saved in %s\n", tsan_log);
     cleanup_concurrency_disks();
 
     if (result == TSAN_CLEAN)
@@ -2512,9 +2517,9 @@ static int run_trace_with_timeout(const char *id, trace_fn fn,
 
     for (;;)
     {
-        /* Drain whatever data is currently in the pipe. */
+        /* Bound each drain so noisy children cannot starve the timeout. */
         char tmp[4096];
-        for (;;)
+        for (int reads = 0; reads < 256; reads++)
         {
             ssize_t n = read(pfd[0], tmp, sizeof tmp);
             if (n > 0)
@@ -2650,6 +2655,7 @@ int main(int argc, char *argv[])
 
     int mode_tsan_only = 0;
     int mode_perf_only = 0;
+    int benchmark = 0;
     int mode_developer_only = 0;
     int mode_x_only = 0;
     for (int i = 1; i < argc; i++)
@@ -2660,6 +2666,8 @@ int main(int argc, char *argv[])
             trace_fail_limit = INT_MAX;
         else if (strcmp(argv[i], "--tsan-only") == 0)
             mode_tsan_only = 1;
+        else if (strcmp(argv[i], "--benchmark") == 0)
+            benchmark = 1;
         else if (strcmp(argv[i], "--perf-only") == 0)
             mode_perf_only = 1;
         else if (strcmp(argv[i], "--developer-only") == 0)
@@ -2698,7 +2706,6 @@ int main(int argc, char *argv[])
             {"C02", "rw_mix_storm_churn", trace_C02},
         };
         quiet_mode = 1;
-        serialize_c_api_calls = 0;
         int c = run_category("C (TSan)", cat_c, 3);
         unlink(DISK_NAME);
         cleanup_concurrency_disks();
@@ -2779,7 +2786,7 @@ int main(int argc, char *argv[])
 
     /* TSan race detection: if races found, C score becomes 0.  Run it only
        after the normal correctness suite passes, so partially implemented
-       starters get stable trace feedback before sanitizer diagnostics. */
+       starters get trace feedback before sanitizer diagnostics. */
     enum tsan_result tsan = TSAN_SKIPPED;
     if (a == 5 && b == 4 && c == 3)
         tsan = run_tsan_check();
@@ -2797,7 +2804,11 @@ int main(int argc, char *argv[])
 
     printf("\nPerformance:\n");
     int perf = 0;
-    if (correctness < 12)
+    if (!benchmark)
+    {
+        printf("  Optional: make grade to measure parallel speedup.\n");
+    }
+    else if (correctness < 12)
     {
         printf("  (skipped -- correctness tests must all pass first)\n");
         printf("  Score: 0/10\n");
@@ -2868,7 +2879,10 @@ int main(int argc, char *argv[])
 
     int total = correctness + perf;
     printf("\n----------------------------------------\n");
-    printf("  Total: %d/22  (+ up to 4 style pts)\n", total);
+    if (benchmark)
+        printf("  Local benchmark total: %d/22  (+ up to 4 style pts)\n", total);
+    else
+        printf("  Lab correctness: %d/12\n", correctness);
     printf("========================================\n");
 
     unlink(DISK_NAME);

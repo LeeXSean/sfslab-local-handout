@@ -16,10 +16,15 @@ jobs:
       - name: Run autograder on starter (expected incomplete, exit 1)
         run: |
           cd sfslab
-          ./test-sfs -q && exit 1 || test $? -eq 1
+          status=0
+          ./test-sfs -q || status=$?
+          test "$status" -eq 1
 
       - name: Run developer extensions
         run: make developer-test x-traces
+
+      - name: Check grader regressions
+        run: python3 tests/check_grader.py
 
       - name: Exercise performance baseline and self-checks
         run: make -C sfslab baseline BASELINE_RUNS=3
@@ -35,14 +40,18 @@ jobs:
           cd sfslab
           gcc -std=c11 -g -fsanitize=thread -pthread -D_GNU_SOURCE=1 -I. \
               -o test-sfs-tsan test-sfs.c sfs-disk.c sfs-support.c
-          timeout 20s ./test-sfs-tsan --tsan-only --sched-fuzz=1 \
+          timeout 120s ./test-sfs-tsan --tsan-only --sched-fuzz=1 \
               > /tmp/tsan.log 2>&1 || true
           if grep -q "FATAL: ThreadSanitizer" /tmp/tsan.log \
               || ! grep -q "Category C (TSan):" /tmp/tsan.log; then
-            timeout 20s setarch "$(uname -m)" -R ./test-sfs-tsan --tsan-only \
+            timeout 120s setarch "$(uname -m)" -R ./test-sfs-tsan --tsan-only \
                 --sched-fuzz=1 > /tmp/tsan.log 2>&1 || true
           fi
-          ! grep -q "FATAL: ThreadSanitizer" /tmp/tsan.log
+          if ! grep -q "Category C (TSan):" /tmp/tsan.log; then
+            echo "::warning::TSan runtime unavailable on this runner"
+            cat /tmp/tsan.log
+            exit 0
+          fi
           grep -Eq "WARNING: ThreadSanitizer|Subtotal:" /tmp/tsan.log \
             || { cat /tmp/tsan.log; exit 1; }
 

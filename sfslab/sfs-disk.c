@@ -760,14 +760,14 @@ int sfs_ftruncate(int fd, size_t length)
 ssize_t sfs_getpos(int fd)
 {
     // It's your job as the student to implement this function.
-    // See sfs-disk.h for the specification.
+    // See sfs-api.h for the specification.
     return -ENOSYS;
 }
 
 ssize_t sfs_seek(int fd, ssize_t delta)
 {
     // It's your job as the student to implement this function.
-    // See sfs-disk.h for the specification.
+    // See sfs-api.h for the specification.
     return -ENOSYS;
 }
 
@@ -811,7 +811,7 @@ int sfs_rename(const char *old_name, const char *new_name)
         return -EINVAL;
 
     // It's your job as the student to implement this function.
-    // See sfs-disk.h for the specification.
+    // See sfs-api.h for the specification.
     return -ENOSYS;
 }
 
