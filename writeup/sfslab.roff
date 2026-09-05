@@ -152,7 +152,7 @@ SFS Lab: Writing a Multithreaded File System
 .ft R
 .sp 0.2v
 .ce 1
-Last updated: July 10, 2026
+Last updated: September 4, 2026
 .sp 0.35v
 .in 0.55i
 .ll 5.95i
@@ -200,7 +200,7 @@ allowing concurrent and fast access to the file system for separate users.
 This edition of the lab is self-contained and self-graded: there is no
 Autolab, no handin directory, and no course server.  The test driver
 described in Section 6 plays the role of the autograder, and the score it
-prints is the score the lab gives you.
+prints is local feedback, not an official CMU grade.
 .PP
 The scored student work remains confined to
 .CW sfs-disk.c ;
@@ -377,8 +377,8 @@ correctness only.  This can be done by locking the entire file system
 around every API call, exactly as the calibration reference
 .CW sfs-baseline-ref.c
 does.  Expect a performance ratio near 1.0\(mu and a performance score of
-3/10 (Section 6.3).  That is the intended first checkpoint, not the
-destination.
+3/10 in the optional benchmark (Section 6.3).  A correct global-lock
+implementation completes the basic exercise; optimization is a follow-up.
 .PP
 Second, think about readers and writers.  When reading, no shared data
 changes except the reading descriptor's own position, so multiple readers
@@ -411,7 +411,8 @@ Zero-block empty files, expandable directories, and Unix unlink are unscored.
 .bp
 .SEC "Evaluation"
 .LP
-The total is 26 points:
+The basic exercise requires 12 correctness points.  The optional benchmark
+adds 10 performance points, with 4 style points for self-review:
 .TS
 center box tab(;);
 lb cb lb
@@ -444,19 +445,12 @@ on-disk structure is corrupt (orphaned blocks, inconsistent links, sizes
 that disagree with the allocation).  The first checker diagnostic is
 included in the failure output.
 .PP
-The Category C traces run each SFS call under a serializing wrapper, so
-they measure functional correctness under interleaved \(em but not truly
-simultaneous \(em calls.  This keeps the feedback stable while your locking
-is unfinished.  C02 ends with a directory-churn phase: four threads
-create, rename, and remove their own files while a fifth repeatedly lists
-the directory.  While
-.CW sfs_rename
-is still the
-.CW \-ENOSYS
-starter stub, the churn threads fall back to plain removes, so Category C
-passes on the unmodified handout; once you implement
-.CW sfs_rename ,
-the same phase exercises overwrite-rename against the live listing.
+Category C makes genuinely concurrent calls, including on systems without
+ThreadSanitizer.  The test driver does not supply locks for your code.
+Failures on the unlocked starter may vary between runs.  Start with one
+mutex around the API, then refine only after correctness passes.
+The listing trace always finishes each directory walk before starting another,
+so holding a directory lock across an entire walk is supported.
 .PP
 Every trace \(em A and B included \(em runs in a forked child with a
 30-second wall-clock budget.  A deadlock, crash, or assertion failure in
@@ -464,30 +458,19 @@ your code therefore fails that one trace (reported as TIMEOUT or CRASH)
 instead of taking down the driver.
 .SUB "Race detection"
 .PP
-After all twelve correctness traces pass, the driver compiles a
-ThreadSanitizer build of your implementation and re-runs the Category C
-traces with the serializing wrapper
-.I disabled ,
-making real concurrent calls.  The rerun sweeps three seeded
-\(lqschedule-fuzz\(rq runs, each injecting a different pattern of random
-yields and microsleeps around SFS calls, so races that hide under one
-particular interleaving still get a chance to surface.  Because the sweep reruns the same C traces, the C02
-churn phase hands the sanitizer real concurrent create, rename, remove,
-and list executions \(em forgetting to lock
-.CW sfs_rename
-is caught here even though the serialized run cannot see it.  If TSan
-reports a data race \(em or the sanitized traces fail or time out \(em the
-Category C score is set to 0, even though the normal traces passed.  The
-failing seed is reported so you can replay it (Section 7.3).
+After all twelve correctness traces pass, the driver attempts a
+ThreadSanitizer build and reruns Category C under three schedule-fuzz seeds.
+Data races and functional failures fail the concurrency check.  The sanitizer
+has a 120-second budget per sweep, covering the three 30-second traces plus
+startup overhead.  Failure diagnostics remain in tsan_output.log.
 .PP
-If your system cannot run ThreadSanitizer at all, the check is skipped
-without penalty \(em but understand what that means: the serialized C
-traces alone cannot see data races, so on such a machine the Category C
-score is a functional signal only.  The driver says so when it skips;
-rerun on a TSan-capable machine before trusting the concurrency score.
+If the runtime cannot start, it is reported as unavailable without deducting
+points.  Normal concurrent tests still run, but passing tests cannot prove
+that no race exists.  Use a TSan-capable environment for additional checking.
 .SUB "Performance (10 points)"
 .PP
-The performance benchmark runs only after correctness is 12/12.  It starts
+The optional performance benchmark runs with make grade or
+./test-sfs --benchmark, and only after correctness is 12/12.  It starts
 8 threads, each working on its own file.  A thread performs 16000
 .I sessions ;
 one session is one
@@ -525,12 +508,10 @@ _
 < 0.85;0/10;slower than the naive baseline
 .TE
 .LP
-These bars are calibrated against real implementations: a correct solution
-that keeps one global mutex measures about 1.0\(mu and earns 3/10, while a
-per-file locking scheme measures 4.5\(en5\(mu on an 8-hardware-thread
-machine and clears 10/10 with a wide margin.  The 2.5\(mu bar is
-deliberately below what per-file locking achieves even on a 4-core machine,
-so full marks stay reachable on small CPUs.
+These thresholds are local comparison targets, not verified official grades.
+Core count, scheduling, and the machine affect achievable speedup.  Use the
+ratio to compare your own designs; no speedup threshold is required to
+complete the basic exercise.
 .PP
 If
 .CW .perf_baseline
@@ -561,8 +542,8 @@ image(s) under
 .CW fail_<trace>_<image>.img
 and prints the path, so you can inspect the exact corrupted state instead
 of re-running under a debugger.
-.CW "make clean"
-removes the copies, or set
+The copies live in a private sfs-test.* directory, printed by the driver.
+Remove that directory yourself after inspection, or set
 .CW SFS_KEEP_FAILED_DISKS=0
 to disable them.
 .SUB "The consistency checker"
@@ -579,16 +560,17 @@ The driver names its working images
 .CW test_conc_*.img
 (Category C), and
 .CW test_perf.img
-(the benchmark), and removes them again by the end of a run.  The image
+(the benchmark), inside a private sfs-test.* directory.  It removes
+working images by the end of a run, preserving failure snapshots.  The image
 you point the checker at is therefore usually a
 .CW fail_*.img
 snapshot from Section 7.1 \(em or any image your own experiments create
 with
 .CW sfs_format :
 .CS
-linux> ./sfs-fsck fail_B01_test.img            # any structural errors?
-linux> ./sfs-fsck -v fail_B01_test.img         # narrate the check
-linux> ./sfs-fsck --dump fail_B01_test.img     # show the structure found
+linux> ./sfs-fsck sfs-test.XXXXXX/fail_B01_test.img
+linux> ./sfs-fsck -v sfs-test.XXXXXX/fail_B01_test.img
+linux> ./sfs-fsck --dump sfs-test.XXXXXX/fail_B01_test.img
 .CE
 .LP
 .CW \-\-dump
@@ -610,8 +592,8 @@ linux> ./test-sfs-tsan --tsan-only --sched-fuzz=2
 .LP
 Replace
 .CW 2
-with whatever seed the driver reported.  The same seed reproduces the same
-schedule perturbation, so a failure found under fuzz is replayable.  The
+with whatever seed the driver reported.  The same seed requests similar perturbations; OS scheduling can still
+change the execution, so rerunning need not reproduce a failure.  The
 normal correctness pass never fuzzes; only the TSan sweep and explicit
 .CW \-\-sched-fuzz
 invocations do.
@@ -620,7 +602,7 @@ invocations do.
 Calibrate once per machine with
 .CW "make baseline" ,
 then run
-.CW ./test-sfs ;
+.CW "./test-sfs --benchmark" ;
 .CW "make grade"
 does both.  The calibration prints a
 .CW spread
@@ -632,7 +614,7 @@ for a tighter (odd) sample count on noisy machines.
 .PP
 Bind-mounted disk I/O can distort the benchmark.  Run
 \f(CRexport SFS_DISK_DIR=/tmp\fP before both \f(CRmake baseline\fP and
-\f(CR./test-sfs\fP.  The driver records the setting in
+\f(CR./test-sfs --benchmark\fP.  The driver records the setting in
 \f(CR.perf_baseline\fP; a mismatch disables ratio scoring and caps performance
 at 5/10.
 .SEC "Hints"

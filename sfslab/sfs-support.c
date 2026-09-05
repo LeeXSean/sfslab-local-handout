@@ -23,7 +23,7 @@ static size_t diskSizeInBytes = 0;
     macro, because the second and third arguments are not values.
     Code simplified from linux/kernel.h.  */
 #define container_of(field_ptr, ct_type, field_name)                           \
-    ((ct_type *)((char *)(field_ptr)) - offsetof(ct_type, field_name))
+    ((ct_type *)((char *)(field_ptr) - offsetof(ct_type, field_name)))
 
 /** Set a block's type to TYPE, which should be one of the SFS_BLOCK_TYPE_*
     constants.  */

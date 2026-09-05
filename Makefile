@@ -18,7 +18,7 @@ test:
 clean:
 	$(MAKE) -C $(HANDOUT) clean
 
-# Rebuild the handout tarball deterministically from committed files
+# Rebuild the handout tarball deterministically from the working tree
 # (requires GNU tar).  The PDF is packed as-is, never rebuilt, so the
 # tarball does not depend on the PDF toolchain; the mtime check below
 # warns when the writeup source looks newer than the packed PDF (a
@@ -30,7 +30,7 @@ dist:
 	  echo "warning: sfslab.pdf is older than writeup/sfslab.roff;" >&2; \
 	  echo "         run 'make pdf' first or the tarball ships a stale writeup" >&2; \
 	fi
-	@tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/sfslab-dist.XXXXXX"); \
+	@set -e; tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/sfslab-dist.XXXXXX"); \
 	trap 'rm -rf "$$tmp"' EXIT HUP INT TERM; \
 	mkdir "$$tmp/$(HANDOUT)"; \
 	cp $(addprefix $(HANDOUT)/,$(HANDOUT_FILES)) "$$tmp/$(HANDOUT)/"; \
