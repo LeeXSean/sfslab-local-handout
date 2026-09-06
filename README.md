@@ -1,55 +1,38 @@
 # sfslab
 
-A personal self-study port of the Shark File System lab from CMU 15-213 / 15-513.
-Implement three file APIs, make them thread-safe, then optionally explore parallel speedup.
+A self-study port of CMU 15-213 / 15-513's Shark File System lab.
+Complete three file APIs, then make them thread-safe.
 
-## Contents
+[Writeup](sfslab.pdf) · [Starter](sfslab/) · [Offline handout](sfslab-handout.tar)
 
-| Path | Contents |
-| --- | --- |
-| `sfslab/` | Starter sources, test driver, and disk checker |
-| `sfslab.pdf` | Lab writeup |
-| `writeup/sfslab.roff` | Source for the writeup |
-| `sfslab-handout.tar` | Offline starter package |
-| `tests/check_grader.py` | Checks for the test infrastructure |
+## Use
 
-## Usage
-
-Use Linux or WSL. From the repository root:
+Linux or WSL. Read the writeup and [handout README](sfslab/README), then implement
+`sfs_getpos`, `sfs_seek`, and `sfs_rename` in [sfs-disk.c](sfslab/sfs-disk.c).
+Run from the repository root:
 
 ```sh
 make
 make test
 ```
 
-Read [the lab writeup](sfslab.pdf) and [the handout README](sfslab/README).
-Edit `sfslab/sfs-disk.c`: `sfs_getpos`, `sfs_seek`, and `sfs_rename` are intentionally unfinished.
+The starter fails tests until the APIs and synchronization are implemented.
+A single mutex and all 12 correctness traces complete the basic exercise.
+The concurrent traces make real parallel calls; ThreadSanitizer adds race
+diagnostics when available.
 
-## Learning Path
+## Notes
 
-1. Implement the three APIs and pass the sequential tests.
-2. Start with one mutex and pass all 12 correctness traces. Ordinary tests make
-   real concurrent calls; ThreadSanitizer adds race diagnostics when available.
-3. Optionally refine the locks and run `make -C sfslab grade` to compare speedup.
-   A correct coarse-lock implementation completes the basic exercise.
-
-Use `main` for the basic lab. The `developer` branch adds file sizing,
-expandable directories, and Unix-style unlink as optional extensions.
-
-## Local Notes
-
-- The starter fails tests by design; concurrent failures vary until locks are added.
-- The local 22-point benchmark is an exercise, not CMU's official grading scale.
-- Each run uses a private `sfs-test.*` directory and retains failure images there.
+- Use `main` for the basic lab. The `developer` branch adds optional file sizing,
+  directory growth, and Unix-style unlink.
+- `make -C sfslab grade` measures optional parallel speedup. Its local 22-point
+  scale is not CMU's official grading scale.
+- Test runs use private `sfs-test.*` directories and retain failure images.
   `make clean` removes build products, not disk images.
-- `make pdf dist` rebuilds the writeup and package. After `make`, run
-  `python3 tests/check_grader.py` to check the test infrastructure.
-- Extract the offline package in a new directory with `tar xf sfslab-handout.tar`,
+- Extract the offline handout in a new directory with `tar xf sfslab-handout.tar`,
   then run `make` inside `sfslab/`.
-- Keep completed student solutions in your own private working copy.
+- `make pdf dist` rebuilds the writeup and handout. After a build,
+  `python3 tests/check_grader.py` checks the test infrastructure.
 
-## Sources
-
-This is an independent port of CMU's Shark File System lab, not an official
-release or a repository affiliated with the course. See [NOTICE.md](NOTICE.md)
-for provenance and the boundary between the starter and completed solutions.
+Keep completed student solutions private. This is an independent port;
+[NOTICE.md](NOTICE.md) records its provenance and the starter/solution boundary.
